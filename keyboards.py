@@ -120,3 +120,22 @@ def delete_confirm_keyboard(habit_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Отмена", callback_data=f"delno:{habit_id}")],
         ]
     )
+
+
+def reminder_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки на шаге выбора времени напоминания: можно вовсе отключить напоминание."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Без напоминания", callback_data="rtoff")],
+            [InlineKeyboardButton(text="Отмена", callback_data="fsm_cancel")],
+        ]
+    )
+
+
+def due_habits_keyboard(habits) -> InlineKeyboardMarkup:
+    """Список привычек, которые сегодня нужно отметить."""
+    rows = [
+        [InlineKeyboardButton(text=h["title"], callback_data=f"done:{h['id']}")]
+        for h in habits
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -85,11 +85,18 @@ def _habit_card_text(habit, user) -> str:
     required = db.is_required_today(
         habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
     )
-    status = "сегодня нужно выполнить" if required else "сегодня выполнять не нужно"
+    log = db.get_log(habit["id"], today.isoformat())
+    if log is not None and log["status"] == "completed":
+        status = "выполнено сегодня"
+    elif required:
+        status = "сегодня нужно выполнить"
+    else:
+        status = "сегодня выполнять не нужно"
+    reminder = habit["reminder_time"] if habit["reminder_time"] else "выкл"
     return (
         f"{habit['title']}\n\n"
         f"Расписание: {db.format_schedule(habit['schedule_type'], habit['schedule_data'])}\n"
-        f"Напоминание: {habit['reminder_time']}\n"
+        f"Напоминание: {reminder}\n"
         f"Текущая серия: {habit['current_streak']} дн.\n"
         f"Статус: {status}"
     )
@@ -101,6 +108,21 @@ async def _send_habit_card(target: Message, habit_id: int, telegram_id: int) -> 
         await target.answer("Привычка не найдена.")
         return
     await target.answer(_habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id))
+
+
+def _due_habits(user):
+    """Привычки, обязательные сегодня и ещё не отмеченные."""
+    today = db.user_now(user["timezone"]).date()
+    due = []
+    for h in db.get_habits(user["id"]):
+        if h["is_paused"]:
+            continue
+        if not db.is_required_today(h["schedule_type"], h["schedule_data"], h["start_date"], today):
+            continue
+        if db.get_log(h["id"], today.isoformat()) is not None:
+            continue
+        due.append(h)
+    return due
 
 
 async def _guard_menu(message: Message, state: FSMContext) -> bool:
@@ -125,8 +147,9 @@ async def _proceed_after_schedule(target: Message, state: FSMContext, telegram_i
     else:
         await state.set_state(HabitForm.reminder_time)
         await target.answer(
-            "Во сколько напоминать? Формат ЧЧ:ММ, например 08:30.",
-            reply_markup=kb.cancel_inline(),
+            "Во сколько напоминать? Формат ЧЧ:ММ, например 08:30.\n"
+            "Или нажми «Без напоминания», если уведомление не нужно.",
+            reply_markup=kb.reminder_prompt_keyboard(),
         )
 
 
@@ -222,8 +245,9 @@ async def add_reminder_time(message: Message, state: FSMContext):
     t = _parse_hhmm(message.text or "")
     if t is None:
         await message.answer(
-            "Формат ЧЧ:ММ, например 08:30. Попробуй ещё раз (или /cancel).",
-            reply_markup=kb.cancel_inline(),
+            "Формат ЧЧ:ММ, например 08:30. Попробуй ещё раз, "
+            "или нажми «Без напоминания».",
+            reply_markup=kb.reminder_prompt_keyboard(),
         )
         return
     data = await state.get_data()
@@ -267,8 +291,8 @@ async def edit_time_apply(message: Message, state: FSMContext):
     t = _parse_hhmm(message.text or "")
     if t is None:
         await message.answer(
-            "Формат ЧЧ:ММ, например 08:30. Ещё раз (или /cancel).",
-            reply_markup=kb.cancel_inline(),
+            "Формат ЧЧ:ММ, например 08:30. Ещё раз, или нажми «Без напоминания».",
+            reply_markup=kb.reminder_prompt_keyboard(),
         )
         return
     data = await state.get_data()
@@ -333,6 +357,32 @@ async def toggle_weekday(callback: CallbackQuery, state: FSMContext):
         selected.add(i)
     await state.update_data(wd_selected=sorted(selected))
     await callback.message.edit_reply_markup(reply_markup=kb.weekday_keyboard(selected))
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(HabitForm.reminder_time, HabitForm.edit_time), F.data == "rtoff")
+async def reminder_off(callback: CallbackQuery, state: FSMContext):
+    """Отключение напоминания: при добавлении завершает создание, при редактировании — снимает время."""
+    cur_state = await state.get_state()
+    data = await state.get_data()
+    if cur_state == HabitForm.reminder_time.state:
+        user = db.get_user(callback.from_user.id)
+        today = db.user_now(user["timezone"]).date().isoformat()
+        db.add_habit(
+            user["id"], data["title"], data["schedule_type"], data.get("schedule_data"), None, today
+        )
+        await state.clear()
+        await callback.message.edit_text(
+            f"Привычка «{data['title']}» добавлена.\n"
+            f"Расписание: {db.format_schedule(data['schedule_type'], data.get('schedule_data'))}\n"
+            "Напоминание: выкл."
+        )
+        await callback.message.answer("Готово.", reply_markup=kb.main_menu())
+    else:
+        db.update_habit_time(data["habit_id"], None)
+        await state.clear()
+        await callback.message.edit_text("Напоминание выключено.")
+        await _send_habit_card(callback.message, data["habit_id"], callback.from_user.id)
     await callback.answer()
 
 
@@ -405,7 +455,9 @@ async def edit_time_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(HabitForm.edit_time)
     await state.update_data(habit_id=habit_id)
     await callback.message.answer(
-        "Введи новое время напоминания (ЧЧ:ММ).", reply_markup=kb.cancel_inline()
+        "Введи новое время напоминания (ЧЧ:ММ) "
+        "или нажми «Без напоминания», чтобы отключить.",
+        reply_markup=kb.reminder_prompt_keyboard(),
     )
     await callback.answer()
 
@@ -449,6 +501,35 @@ async def delete_no(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("done:"))
+async def mark_done(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    today = db.user_now(user["timezone"]).date()
+    if not db.is_required_today(
+        habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
+    ):
+        await callback.answer("Сегодня эта привычка не обязательна.", show_alert=True)
+        return
+    result = db.complete_habit(habit_id, today.isoformat())
+    if result is None:
+        await callback.answer("Уже отмечено сегодня.", show_alert=True)
+    else:
+        await callback.answer(
+            f"+{result['xp']} XP, +{result['coins']} монета. Серия: {result['streak']} дн."
+        )
+    due = _due_habits(user)
+    if not due:
+        await callback.message.edit_text("Готово. Все привычки на сегодня отмечены.")
+    else:
+        await callback.message.edit_text(
+            "Отметь выполненные за сегодня:", reply_markup=kb.due_habits_keyboard(due)
+        )
+
+
 # =========================================================
 #  Кнопки главного меню
 # =========================================================
@@ -485,6 +566,26 @@ async def my_habits(message: Message, state: FSMContext):
         await message.answer("Твои привычки:", reply_markup=kb.habits_list_keyboard(habits))
 
 
+@router.message(F.text == kb.BTN_CHECK)
+async def check_menu(message: Message, state: FSMContext):
+    user = _active_user(message.from_user.id)
+    if user is None:
+        await message.answer("Сначала нажми /start и выбери часовой пояс.")
+        return
+    if not db.get_habits(user["id"]):
+        await message.answer("Сначала добавь привычки.")
+        return
+    due = _due_habits(user)
+    if not due:
+        await message.answer(
+            "На сегодня отмечать нечего: всё выполнено или сегодня нет обязательных привычек."
+        )
+        return
+    await message.answer(
+        "Отметь выполненные за сегодня:", reply_markup=kb.due_habits_keyboard(due)
+    )
+
+
 @router.message(F.text == kb.BTN_BALANCE)
 async def show_balance(message: Message):
     user = _active_user(message.from_user.id)
@@ -512,7 +613,7 @@ async def show_settings(message: Message):
     )
 
 
-PLACEHOLDER_BUTTONS = {kb.BTN_CHECK, kb.BTN_STATS, kb.BTN_SHOP, kb.BTN_ACHIEVEMENTS}
+PLACEHOLDER_BUTTONS = {kb.BTN_STATS, kb.BTN_SHOP, kb.BTN_ACHIEVEMENTS}
 
 
 @router.message(F.text.in_(PLACEHOLDER_BUTTONS))

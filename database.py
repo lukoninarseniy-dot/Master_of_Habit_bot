@@ -274,3 +274,60 @@ def format_schedule(schedule_type: str, schedule_data: str | None) -> str:
         return ", ".join(config.WEEKDAY_NAMES[d] for d in sorted(days))
 
     return "—"
+
+
+# =========================================================
+#  Логи выполнения (Шаг 3)
+# =========================================================
+
+def get_log(habit_id: int, date_str: str) -> sqlite3.Row | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM habit_logs WHERE habit_id = ? AND date = ?",
+        (habit_id, date_str),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def complete_habit(habit_id: int, date_str: str) -> dict | None:
+    """Отмечает привычку выполненной за указанную дату.
+
+    Возвращает словарь с начислениями и новой серией, либо None, если запись
+    за этот день уже есть (защита UNIQUE(habit_id, date) — не начисляем дважды).
+    """
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO habit_logs (habit_id, date, status, created_at) "
+        "VALUES (?, ?, 'completed', ?)",
+        (habit_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return None  # уже отмечено за этот день
+
+    # Растёт серия; заодно обновляем рекорд longest_streak.
+    conn.execute(
+        "UPDATE habits SET current_streak = current_streak + 1, "
+        "longest_streak = MAX(longest_streak, current_streak + 1) WHERE id = ?",
+        (habit_id,),
+    )
+
+    # Начисляем XP и монеты владельцу привычки.
+    owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
+    conn.execute(
+        "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
+        (config.XP_PER_COMPLETION, config.COINS_PER_COMPLETION, owner["user_id"]),
+    )
+
+    new_streak = conn.execute(
+        "SELECT current_streak FROM habits WHERE id = ?", (habit_id,)
+    ).fetchone()[0]
+
+    conn.commit()
+    conn.close()
+    return {
+        "xp": config.XP_PER_COMPLETION,
+        "coins": config.COINS_PER_COMPLETION,
+        "streak": new_streak,
+    }

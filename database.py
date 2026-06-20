@@ -1,5 +1,6 @@
+import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 import config
@@ -14,11 +15,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаёт все таблицы, если их ещё нет. Вызывается один раз при старте бота.
-
-    Таблицы создаём сразу все (по разделу 14 ТЗ), хотя на Шаге 1 используется
-    только users. Так на следующих шагах не придётся менять схему базы.
-    """
+    """Создаёт все таблицы по разделу 14 ТЗ, если их ещё нет."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -93,11 +90,12 @@ def init_db() -> None:
 
 
 def _now_utc_iso() -> str:
-    """Текущее время UTC в виде строки (для служебных меток created_at)."""
     return datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
 
 
-# --- Работа с пользователями ---
+# =========================================================
+#  Пользователи
+# =========================================================
 
 def get_user(telegram_id: int) -> sqlite3.Row | None:
     conn = get_connection()
@@ -109,7 +107,6 @@ def get_user(telegram_id: int) -> sqlite3.Row | None:
 
 
 def create_user(telegram_id: int, username: str | None) -> None:
-    """Создаёт пользователя без часового пояса (его выберем сразу после /start)."""
     conn = get_connection()
     conn.execute(
         "INSERT OR IGNORE INTO users (telegram_id, username, created_at) VALUES (?, ?, ?)",
@@ -130,9 +127,150 @@ def set_timezone(telegram_id: int, timezone: str) -> None:
 
 
 def user_now(timezone: str) -> datetime:
-    """Текущее дата-время в часовом поясе пользователя.
-
-    Понадобится на следующих шагах (дни, напоминания, штрафы считаются
-    по времени пользователя).
-    """
+    """Текущее дата-время в часовом поясе пользователя."""
     return datetime.now(ZoneInfo(timezone))
+
+
+# =========================================================
+#  Привычки
+# =========================================================
+
+def count_habits(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM habits WHERE user_id = ?", (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def add_habit(
+    user_id: int,
+    title: str,
+    schedule_type: str,
+    schedule_data: str | None,
+    reminder_time: str,
+    start_date: str,
+) -> int:
+    conn = get_connection()
+    cur = conn.execute(
+        """INSERT INTO habits
+           (user_id, title, schedule_type, schedule_data, reminder_time, start_date, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, title, schedule_type, schedule_data, reminder_time, start_date, _now_utc_iso()),
+    )
+    conn.commit()
+    habit_id = cur.lastrowid
+    conn.close()
+    return habit_id
+
+
+def get_habits(user_id: int) -> list[sqlite3.Row]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM habits WHERE user_id = ? ORDER BY id", (user_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_habit(habit_id: int) -> sqlite3.Row | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM habits WHERE id = ?", (habit_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def update_habit_title(habit_id: int, title: str) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE habits SET title = ? WHERE id = ?", (title, habit_id))
+    conn.commit()
+    conn.close()
+
+
+def update_habit_schedule(habit_id: int, schedule_type: str, schedule_data: str | None) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE habits SET schedule_type = ?, schedule_data = ? WHERE id = ?",
+        (schedule_type, schedule_data, habit_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_habit_time(habit_id: int, reminder_time: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE habits SET reminder_time = ? WHERE id = ?", (reminder_time, habit_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_habit(habit_id: int) -> None:
+    """Полностью удаляет привычку и её логи."""
+    conn = get_connection()
+    conn.execute("DELETE FROM habit_logs WHERE habit_id = ?", (habit_id,))
+    conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+#  Логика расписания (раздел 4.2 ТЗ) — нужна для списка и для штрафов на Шаге 4
+# =========================================================
+
+def is_required_today(
+    schedule_type: str, schedule_data: str | None, start_date_str: str, today: date
+) -> bool:
+    """Обязателен ли сегодня день для этой привычки."""
+    if schedule_type == "daily":
+        return True
+
+    if schedule_type == "every_n_days":
+        try:
+            n = int(schedule_data)
+        except (TypeError, ValueError):
+            return False
+        if n < 1:
+            return False
+        start = date.fromisoformat(start_date_str)
+        delta = (today - start).days
+        if delta < 0:
+            return False
+        return delta % n == 0
+
+    if schedule_type == "weekdays":
+        try:
+            days = json.loads(schedule_data)
+        except (TypeError, ValueError):
+            return False
+        return today.weekday() in days
+
+    return False  # custom — резерв на будущее
+
+
+def format_schedule(schedule_type: str, schedule_data: str | None) -> str:
+    """Человекочитаемое описание расписания."""
+    if schedule_type == "daily":
+        return "каждый день"
+
+    if schedule_type == "every_n_days":
+        try:
+            n = int(schedule_data)
+        except (TypeError, ValueError):
+            return "—"
+        if n == 2:
+            return "через день"
+        return f"каждые {n} дн."
+
+    if schedule_type == "weekdays":
+        try:
+            days = json.loads(schedule_data)
+        except (TypeError, ValueError):
+            return "—"
+        return ", ".join(config.WEEKDAY_NAMES[d] for d in sorted(days))
+
+    return "—"

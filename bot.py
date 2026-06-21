@@ -55,14 +55,6 @@ def level_title(level: int) -> str:
     return "Новичок"
 
 
-def level_from_xp(xp: int) -> int:
-    """Уровень по XP. Чтобы достичь уровня L, нужно накопить 50*(L-1)*L XP."""
-    level = 1
-    while 50 * level * (level + 1) <= xp:
-        level += 1
-    return level
-
-
 def _coins_word(n: int) -> str:
     """Склонение слова «монета» по числу."""
     n = abs(n) % 100
@@ -82,7 +74,7 @@ def _habit_stats_text(habit, user) -> str:
     active = completed + missed + skips
     denom = completed + missed  # обязательные дни минус официальные пропуски
     percent = f"{round(completed / denom * 100)}%" if denom > 0 else "—"
-    level = level_from_xp(user["xp"])
+    level = db.level_from_xp(user["xp"])
     return (
         f"{habit['title']}\n\n"
         f"Активных дней: {active}\n"
@@ -176,7 +168,8 @@ def _due_habits(user):
 def _shop_text(user) -> str:
     return (
         "Магазин\n"
-        f"Баланс: {user['coins']} {_coins_word(user['coins'])}\n\n"
+        f"Баланс: {user['coins']} {_coins_word(user['coins'])}\n"
+        f"Заморозок серии в инвентаре: {user['freeze_count']}\n\n"
         "Выбери покупку:"
     )
 
@@ -205,7 +198,7 @@ async def _finalize_replacement(target: Message, state: FSMContext, telegram_id:
         newly = ach.check_all(
             user["id"], now=db.user_now(user["timezone"]), event="completion", habit_id=habit_id
         )
-        await _notify_achievements(target, newly)
+        await _finish_turn(target, user["id"], newly)
 
 
 async def _notify_achievements(target: Message, newly) -> None:
@@ -223,6 +216,17 @@ async def _notify_achievements(target: Message, newly) -> None:
             reward = f"+{a['xp']} XP" + (f", +{a['coins']}" if a["coins"] else "")
             lines.append(f"{a['icon']} {a['title']} ({reward})")
         await target.answer("\n".join(lines))
+
+
+async def _finish_turn(target: Message, user_id: int, newly) -> None:
+    """Завершает ход: уведомляет об открытых ачивках и о повышении уровня."""
+    await _notify_achievements(target, newly)
+    lv = db.sync_level(user_id)
+    if lv:
+        await target.answer(
+            f"Новый уровень: {lv['new']} ({level_title(lv['new'])})! "
+            f"Бонус +{lv['bonus']} {_coins_word(lv['bonus'])}."
+        )
 
 
 async def _guard_menu(message: Message, state: FSMContext) -> bool:
@@ -364,7 +368,7 @@ async def add_reminder_time(message: Message, state: FSMContext):
         reply_markup=kb.main_menu(),
     )
     newly = ach.check_all(user["id"], event="create")
-    await _notify_achievements(message, newly)
+    await _finish_turn(message, user["id"], newly)
 
 
 @router.message(HabitForm.edit_title)
@@ -488,7 +492,7 @@ async def reminder_off(callback: CallbackQuery, state: FSMContext):
         )
         await callback.message.answer("Готово.", reply_markup=kb.main_menu())
         newly = ach.check_all(user["id"], event="create")
-        await _notify_achievements(callback.message, newly)
+        await _finish_turn(callback.message, user["id"], newly)
     else:
         db.update_habit_time(data["habit_id"], None)
         await state.clear()
@@ -600,7 +604,7 @@ async def delete_yes(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Привычка удалена.")
     await callback.answer()
     newly = ach.check_just_looking(user["id"], start_date, today_iso)
-    await _notify_achievements(callback.message, newly)
+    await _finish_turn(callback.message, user["id"], newly)
 
 
 @router.callback_query(F.data.startswith("delno:"))
@@ -663,7 +667,7 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
             user["id"], now=now_dt, event="completion",
             habit_id=habit_id, perfect_day=bool(perfect),
         )
-        await _notify_achievements(callback.message, newly)
+        await _finish_turn(callback.message, user["id"], newly)
 
 
 @router.callback_query(F.data.startswith("stat:"))
@@ -799,7 +803,7 @@ async def shop_skip_buy(callback: CallbackQuery, state: FSMContext):
             "День нейтральный, серия сохранится."
         )
         newly = ach.check_all(user["id"], event="purchase")
-        await _notify_achievements(callback.message, newly)
+        await _finish_turn(callback.message, user["id"], newly)
 
 
 @router.callback_query(F.data.startswith("replsel:"))
@@ -832,6 +836,47 @@ async def shop_replace_select(callback: CallbackQuery, state: FSMContext):
 async def shop_replace_notext(callback: CallbackQuery, state: FSMContext):
     await _finalize_replacement(callback.message, state, callback.from_user.id, None)
     await callback.answer()
+
+
+@router.callback_query(F.data == "shop:freeze")
+async def shop_freeze(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    if user["coins"] < config.SHOP_FREEZE_COST:
+        await callback.answer(
+            f"Недостаточно монет: нужно {config.SHOP_FREEZE_COST}, у тебя {user['coins']}.",
+            show_alert=True,
+        )
+        return
+    await callback.message.edit_text(
+        f"Купить заморозку серии за {config.SHOP_FREEZE_COST} монет?\n\n"
+        "Она ляжет в инвентарь. При пропуске обязательной привычки с активной серией "
+        "заморозка потратится автоматически: день станет нейтральным, серия сохранится.",
+        reply_markup=kb.freeze_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "freezebuy")
+async def shop_freeze_buy(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    res = db.buy_freeze(user["id"])
+    if res["status"] == "no_coins":
+        await callback.answer(
+            f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.", show_alert=True
+        )
+        return
+    await callback.answer(f"Куплено. Списано {res['cost']} {_coins_word(res['cost'])}.")
+    await callback.message.edit_text(
+        f"Заморозка серии куплена. В инвентаре заморозок: {res['freeze_count']}."
+    )
+    newly = ach.check_all(user["id"], event="purchase")
+    await _finish_turn(callback.message, user["id"], newly)
 
 
 # =========================================================
@@ -919,7 +964,7 @@ async def show_balance(message: Message):
         await message.answer("Сначала нажми /start и выбери часовой пояс.")
         return
     xp = user["xp"]
-    level = level_from_xp(xp)
+    level = db.level_from_xp(xp)
     next_threshold = 50 * level * (level + 1)
     remaining = next_threshold - xp
     await message.answer(
@@ -927,7 +972,8 @@ async def show_balance(message: Message):
         f"Монеты: {user['coins']}\n"
         f"Опыт (XP): {xp}\n"
         f"Уровень: {level} ({level_title(level)})\n"
-        f"До уровня {level + 1}: ещё {remaining} XP"
+        f"До уровня {level + 1}: ещё {remaining} XP\n"
+        f"Заморозок серии: {user['freeze_count']}"
     )
 
 
@@ -951,15 +997,17 @@ async def show_achievements(message: Message, state: FSMContext):
         await message.answer("Сначала нажми /start и выбери часовой пояс.")
         return
     unlocked = db.get_unlocked_codes(user["id"])
-    got = sum(1 for a in ach.CATALOG if a["code"] in unlocked)
-    lines = [f"Достижения: {got} из {len(ach.CATALOG)}", ""]
-    for a in ach.CATALOG:
-        if a["code"] in unlocked:
-            lines.append(f"✅ {a['icon']} {a['title']} — {a['desc']}")
-        elif a["hidden"]:
-            lines.append("🔒 ??? — секрет")
-        else:
-            lines.append(f"🔒 {a['icon']} {a['title']} — {a['desc']}")
+    earned = [a for a in ach.CATALOG if a["code"] in unlocked]
+    total = len(ach.CATALOG)
+    if not earned:
+        await message.answer(
+            f"Пока нет достижений (0 из {total}).\n"
+            "Они открываются по ходу игры — что именно, пусть будет сюрпризом."
+        )
+        return
+    lines = [f"Достижения: {len(earned)} из {total}", ""]
+    for a in earned:
+        lines.append(f"{a['icon']} {a['title']} — {a['desc']}")
     await message.answer("\n".join(lines))
 
 

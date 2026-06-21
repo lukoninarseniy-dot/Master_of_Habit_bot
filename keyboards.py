@@ -167,6 +167,19 @@ def shop_keyboard() -> InlineKeyboardMarkup:
                 text=f"Замена привычки на день — {config.SHOP_REPLACE_COST}",
                 callback_data="shop:replace",
             )],
+            [InlineKeyboardButton(
+                text=f"Заморозка серии — {config.SHOP_FREEZE_COST}",
+                callback_data="shop:freeze",
+            )],
+        ]
+    )
+
+
+def freeze_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, купить", callback_data="freezebuy")],
+            [InlineKeyboardButton(text="Назад", callback_data="shop_back")],
         ]
     )
 

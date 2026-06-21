@@ -153,6 +153,8 @@ def check_all(user_id, *, now=None, event=None, habit_id=None, prior_streak=None
         g("bought_off")
     if db.count_replacements(user_id) >= 1:
         g("chameleon")
+    if db.count_freezes_used(user_id) >= 1:
+        g("ice_break")
 
     # Фейлы
     if db.count_misses(user_id) >= 1:

@@ -38,28 +38,52 @@ def _seen(key: str) -> bool:
 #  Закрытие дня (штрафы) — синхронная работа с базой
 # =========================================================
 
-def _close_out_day(user, day) -> None:
-    """Закрывает один прошедший день: за обязательные, но не отмеченные привычки —
-    штраф и обнуление серии. Полностью идемпотентно (см. db.apply_miss).
-    Ачивки за пропуски выдаются молча (без ночных уведомлений)."""
-    for h in db.get_habits(user["id"]):
+def _close_out_day_core(user, day) -> list:
+    """Закрывает один прошедший день. За обязательные, но не отмеченные привычки:
+    либо тратит заморозку (серия спасена, день нейтральный), либо пропуск со штрафом.
+    Привычки с большей серией обрабатываются первыми — заморозка спасает самую ценную.
+    Возвращает список событий заморозки для уведомления. Ачивки выдаются молча."""
+    events = []
+    habits = sorted(
+        db.get_habits(user["id"]), key=lambda h: h["current_streak"], reverse=True
+    )
+    for h in habits:
         if h["is_paused"]:
             continue
         if not db.is_required_today(h["schedule_type"], h["schedule_data"], h["start_date"], day):
             continue
-        prior_streak = h["current_streak"]
-        if db.apply_miss(h["id"], day.isoformat()):
-            ach.check_all(user["id"], event="miss", prior_streak=prior_streak)
+        res = db.close_out_habit(h["id"], day.isoformat())
+        if res["result"] == "missed":
+            ach.check_all(user["id"], event="miss", prior_streak=res["prior_streak"])
+        elif res["result"] == "frozen":
+            ach.check_all(user["id"])  # для ачивки 🧊
+            events.append({"title": h["title"], "freeze_left": res["freeze_left"]})
+    return events
+
+
+async def _close_out_day(bot, user, day) -> None:
+    """Закрытие дня в полночь: после закрытия уведомляет об использованных заморозках."""
+    events = _close_out_day_core(user, day)
+    for e in events:
+        try:
+            await bot.send_message(
+                user["telegram_id"],
+                f"Заморозка серии использована для «{e['title']}», серия сохранена. "
+                f"Осталось заморозок: {e['freeze_left']}.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить уведомление о заморозке %s", user["telegram_id"])
 
 
 def run_startup_catchup() -> None:
     """При запуске закрывает дни, которые могли быть пропущены, пока бот не работал.
-    Идёт по каждому пользователю и его последним LOOKBACK_DAYS дням (без сегодня)."""
+    Идёт по каждому пользователю и его последним LOOKBACK_DAYS дням (без сегодня).
+    Заморозки тратятся, но без уведомлений (новость уже неактуальна)."""
     for user in db.get_all_users_with_tz():
         try:
             today = datetime.now(ZoneInfo(user["timezone"])).date()
             for i in range(1, LOOKBACK_DAYS + 1):
-                _close_out_day(user, today - timedelta(days=i))
+                _close_out_day_core(user, today - timedelta(days=i))
         except Exception:
             logger.exception("Ошибка catch-up для пользователя %s", user["telegram_id"])
 
@@ -132,9 +156,9 @@ async def _process_user(bot, user) -> None:
     today = now.date()
     hhmm = now.strftime("%H:%M")
 
-    # Полночь — закрываем вчерашний день (штрафы), молча.
+    # Полночь — закрываем вчерашний день (штрафы/заморозки), уведомляем о заморозках.
     if hhmm == "00:00":
-        _close_out_day(user, today - timedelta(days=1))
+        await _close_out_day(bot, user, today - timedelta(days=1))
 
     # Напоминания в их время.
     await _send_reminders(bot, user, today, hhmm)

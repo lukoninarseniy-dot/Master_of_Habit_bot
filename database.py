@@ -420,7 +420,7 @@ def try_award_perfect_day(user_id: int, date_str: str) -> dict | None:
         if log is None:
             return None  # обязательная, но день ещё не закрыт
         status = log["status"]
-        if status == "official_skip":
+        if status in ("official_skip", "freeze"):
             continue  # нейтральный день — не мешает идеальному
         if status in ("completed", "temporary_replace"):
             did_something = True
@@ -744,3 +744,137 @@ def count_consecutive_perfect_days(user_id: int, today_str: str) -> int:
         count += 1
         day -= timedelta(days=1)
     return count
+
+
+# =========================================================
+#  Уровни (Фаза 2)
+# =========================================================
+
+def level_from_xp(xp: int) -> int:
+    """Уровень по XP. Чтобы достичь уровня L, нужно накопить 50*(L-1)*L XP."""
+    level = 1
+    while 50 * level * (level + 1) <= xp:
+        level += 1
+    return level
+
+
+def sync_level(user_id: int) -> dict | None:
+    """Синхронизирует сохранённый уровень с XP. При повышении начисляет бонус монет.
+
+    Возвращает {"old", "new", "bonus"} при повышении уровня, иначе None.
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT xp, level FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    stored = row["level"]
+    new_level = level_from_xp(row["xp"])
+    if new_level == stored:
+        conn.close()
+        return None
+    if new_level > stored:
+        bonus = (new_level - stored) * config.LEVEL_UP_BONUS_COINS
+        conn.execute(
+            "UPDATE users SET level = ?, coins = coins + ? WHERE id = ?",
+            (new_level, bonus, user_id),
+        )
+        conn.commit()
+        conn.close()
+        return {"old": stored, "new": new_level, "bonus": bonus}
+    # уровень почему-то ниже сохранённого — просто синхронизируем без бонуса
+    conn.execute("UPDATE users SET level = ? WHERE id = ?", (new_level, user_id))
+    conn.commit()
+    conn.close()
+    return None
+
+
+# =========================================================
+#  Заморозка серии (Фаза 2)
+# =========================================================
+
+def buy_freeze(user_id: int) -> dict:
+    """Покупка заморозки серии в инвентарь (users.freeze_count)."""
+    conn = get_connection()
+    coins = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()["coins"]
+    if coins < config.SHOP_FREEZE_COST:
+        conn.close()
+        return {"status": "no_coins", "have": coins, "need": config.SHOP_FREEZE_COST}
+    conn.execute(
+        "UPDATE users SET coins = coins - ?, freeze_count = freeze_count + 1 WHERE id = ?",
+        (config.SHOP_FREEZE_COST, user_id),
+    )
+    conn.execute(
+        "INSERT INTO shop_operations (user_id, operation_type, cost, habit_id, payload, created_at) "
+        "VALUES (?, 'freeze_buy', ?, NULL, NULL, ?)",
+        (user_id, config.SHOP_FREEZE_COST, _now_utc_iso()),
+    )
+    freeze_count = conn.execute(
+        "SELECT freeze_count FROM users WHERE id = ?", (user_id,)
+    ).fetchone()["freeze_count"]
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "cost": config.SHOP_FREEZE_COST, "freeze_count": freeze_count}
+
+
+def count_freezes_used(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status = 'freeze'",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def close_out_habit(habit_id: int, day_str: str) -> dict:
+    """Закрывает прошедший день привычки. Если есть заморозка и есть что спасать
+    (серия > 0) — тратит заморозку (день нейтральный, серия сохраняется).
+    Иначе — пропуск: штраф и обнуление серии. Идемпотентно.
+
+    Возвращает {"result": "already"|"frozen"|"missed", ...}.
+    """
+    conn = get_connection()
+    owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
+    if owner is None:
+        conn.close()
+        return {"result": "already"}
+    user_id = owner["user_id"]
+    prior_streak = conn.execute(
+        "SELECT current_streak FROM habits WHERE id = ?", (habit_id,)
+    ).fetchone()[0]
+    freeze = conn.execute(
+        "SELECT freeze_count FROM users WHERE id = ?", (user_id,)
+    ).fetchone()["freeze_count"]
+
+    use_freeze = freeze > 0 and prior_streak > 0
+    status = "freeze" if use_freeze else "missed"
+
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO habit_logs (habit_id, date, status, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (habit_id, day_str, status, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return {"result": "already"}  # день уже был закрыт
+
+    if use_freeze:
+        # тратим заморозку: день нейтральный, серия НЕ трогается
+        conn.execute(
+            "UPDATE users SET freeze_count = freeze_count - 1 WHERE id = ?", (user_id,)
+        )
+        conn.commit()
+        conn.close()
+        return {"result": "frozen", "user_id": user_id, "freeze_left": freeze - 1}
+
+    # обычный пропуск: штраф (не ниже 0) и обнуление серии
+    conn.execute(
+        "UPDATE users SET coins = MAX(0, coins - ?) WHERE id = ?",
+        (config.COINS_PENALTY, user_id),
+    )
+    conn.execute("UPDATE habits SET current_streak = 0 WHERE id = ?", (habit_id,))
+    conn.commit()
+    conn.close()
+    return {"result": "missed", "user_id": user_id, "prior_streak": prior_streak}

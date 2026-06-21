@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import database as db
+import achievements as ach
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +40,16 @@ def _seen(key: str) -> bool:
 
 def _close_out_day(user, day) -> None:
     """Закрывает один прошедший день: за обязательные, но не отмеченные привычки —
-    штраф и обнуление серии. Полностью идемпотентно (см. db.apply_miss)."""
+    штраф и обнуление серии. Полностью идемпотентно (см. db.apply_miss).
+    Ачивки за пропуски выдаются молча (без ночных уведомлений)."""
     for h in db.get_habits(user["id"]):
         if h["is_paused"]:
             continue
         if not db.is_required_today(h["schedule_type"], h["schedule_data"], h["start_date"], day):
             continue
-        db.apply_miss(h["id"], day.isoformat())
+        prior_streak = h["current_streak"]
+        if db.apply_miss(h["id"], day.isoformat()):
+            ach.check_all(user["id"], event="miss", prior_streak=prior_streak)
 
 
 def run_startup_catchup() -> None:

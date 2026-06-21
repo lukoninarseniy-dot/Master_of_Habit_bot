@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import config
@@ -59,6 +59,7 @@ def init_db() -> None:
             status     TEXT NOT NULL,
             mood       TEXT,
             created_at TEXT,
+            local_time TEXT,
             UNIQUE(habit_id, date)
         )
     """)
@@ -541,3 +542,205 @@ def buy_replacement(user_id: int, habit_id: int, date_str: str, alt_text: str | 
     conn.commit()
     conn.close()
     return {"status": "ok", "cost": config.SHOP_REPLACE_COST, "streak": new_streak}
+
+
+# =========================================================
+#  Запросы для движка ачивок (Шаг 7)
+# =========================================================
+
+def get_unlocked_codes(user_id: int) -> set:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT achievement_code FROM user_achievements WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    conn.close()
+    return {r["achievement_code"] for r in rows}
+
+
+def try_unlock_achievement(user_id: int, code: str, xp: int, coins: int) -> bool:
+    """Открывает ачивку и начисляет награду. Идемпотентно (UNIQUE user_id+code)."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO user_achievements (user_id, achievement_code, unlocked_at) "
+        "VALUES (?, ?, ?)",
+        (user_id, code, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    if xp or coins:
+        conn.execute(
+            "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
+            (xp, coins, user_id),
+        )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def count_completions(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status IN ('completed', 'temporary_replace')",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def count_misses(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status = 'missed'",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def max_longest_streak(user_id: int) -> int:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT MAX(longest_streak) AS m FROM habits WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row["m"] or 0
+
+
+def habit_has_missed(habit_id: int) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM habit_logs WHERE habit_id = ? AND status = 'missed' LIMIT 1",
+        (habit_id,),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def count_shop_ops(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM shop_operations WHERE user_id = ?", (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def count_official_skips(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM shop_operations WHERE user_id = ? AND operation_type = 'official_skip'",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def count_replacements(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM shop_operations WHERE user_id = ? AND operation_type = 'replacement'",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def max_consecutive_missed_runs(user_id: int) -> int:
+    """Самая длинная цепочка подряд идущих 'missed' в таймлайне любой привычки."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT l.habit_id, l.status FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? ORDER BY l.habit_id, l.date",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    best = 0
+    run = 0
+    cur_habit = None
+    for r in rows:
+        if r["habit_id"] != cur_habit:
+            cur_habit = r["habit_id"]
+            run = 0
+        if r["status"] == "missed":
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
+def last_completed_date_before(user_id: int, date_str: str) -> str | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT MAX(l.date) AS d FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status IN ('completed', 'temporary_replace') AND l.date < ?",
+        (user_id, date_str),
+    ).fetchone()
+    conn.close()
+    return row["d"]
+
+
+def count_completions_before_hour(user_id: int, tz: str, hour: int) -> int:
+    """Сколько выполнений (completed) было отмечено в локальное время до указанного часа."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT l.created_at FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status = 'completed'",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    zone = ZoneInfo(tz)
+    count = 0
+    for r in rows:
+        try:
+            local = datetime.fromisoformat(r["created_at"]).astimezone(zone)
+        except (TypeError, ValueError):
+            continue
+        if local.hour < hour:
+            count += 1
+    return count
+
+
+def today_has_early_and_late(user_id: int, tz: str, today_str: str) -> bool:
+    """Есть ли сегодня (локально) отметка до 06:00 И отметка после 23:00."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT l.created_at FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status = 'completed'",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    zone = ZoneInfo(tz)
+    early = late = False
+    for r in rows:
+        try:
+            local = datetime.fromisoformat(r["created_at"]).astimezone(zone)
+        except (TypeError, ValueError):
+            continue
+        if local.date().isoformat() != today_str:
+            continue
+        if local.hour < 6:
+            early = True
+        if local.hour >= 23:
+            late = True
+    return early and late
+
+
+def count_consecutive_perfect_days(user_id: int, today_str: str) -> int:
+    """Сколько идеальных дней подряд заканчивая сегодняшним."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT date FROM daily_events WHERE user_id = ? AND event_type = 'perfect_day'",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    dates = {r["date"] for r in rows}
+    count = 0
+    day = date.fromisoformat(today_str)
+    while day.isoformat() in dates:
+        count += 1
+        day -= timedelta(days=1)
+    return count

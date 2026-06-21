@@ -12,6 +12,7 @@ from aiogram.types import Message, CallbackQuery
 import config
 import database as db
 import keyboards as kb
+import achievements as ach
 from scheduler import setup_scheduler, run_startup_catchup
 
 logging.basicConfig(level=logging.INFO)
@@ -201,6 +202,27 @@ async def _finalize_replacement(target: Message, state: FSMContext, telegram_id:
             f"Серия: {res['streak']} дн. Списано {res['cost']} {_coins_word(res['cost'])}.",
             reply_markup=kb.main_menu(),
         )
+        newly = ach.check_all(
+            user["id"], now=db.user_now(user["timezone"]), event="completion", habit_id=habit_id
+        )
+        await _notify_achievements(target, newly)
+
+
+async def _notify_achievements(target: Message, newly) -> None:
+    if not newly:
+        return
+    if len(newly) == 1:
+        a = newly[0]
+        reward = f"+{a['xp']} XP"
+        if a["coins"]:
+            reward += f", +{a['coins']} {_coins_word(a['coins'])}"
+        await target.answer(f"Достижение получено: {a['icon']} {a['title']}! {reward}")
+    else:
+        lines = ["Открыты достижения:"]
+        for a in newly:
+            reward = f"+{a['xp']} XP" + (f", +{a['coins']}" if a["coins"] else "")
+            lines.append(f"{a['icon']} {a['title']} ({reward})")
+        await target.answer("\n".join(lines))
 
 
 async def _guard_menu(message: Message, state: FSMContext) -> bool:
@@ -338,10 +360,11 @@ async def add_reminder_time(message: Message, state: FSMContext):
     await message.answer(
         f"Привычка «{data['title']}» добавлена.\n"
         f"Расписание: {db.format_schedule(data['schedule_type'], data.get('schedule_data'))}\n"
-        f"Напоминание: {t}\n\n"
-        "Напоминания и начисления заработают на следующих шагах.",
+        f"Напоминание: {t}",
         reply_markup=kb.main_menu(),
     )
+    newly = ach.check_all(user["id"], event="create")
+    await _notify_achievements(message, newly)
 
 
 @router.message(HabitForm.edit_title)
@@ -464,6 +487,8 @@ async def reminder_off(callback: CallbackQuery, state: FSMContext):
             "Напоминание: выкл."
         )
         await callback.message.answer("Готово.", reply_markup=kb.main_menu())
+        newly = ach.check_all(user["id"], event="create")
+        await _notify_achievements(callback.message, newly)
     else:
         db.update_habit_time(data["habit_id"], None)
         await state.clear()
@@ -565,13 +590,17 @@ async def delete_ask(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("delyes:"))
 async def delete_yes(callback: CallbackQuery, state: FSMContext):
     habit_id = int(callback.data.split(":", 1)[1])
-    habit, _ = _owned_habit(habit_id, callback.from_user.id)
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
     if habit is None:
         await callback.answer("Не найдено.", show_alert=True)
         return
+    start_date = habit["start_date"]
+    today_iso = db.user_now(user["timezone"]).date().isoformat()
     db.delete_habit(habit_id)
     await callback.message.edit_text("Привычка удалена.")
     await callback.answer()
+    newly = ach.check_just_looking(user["id"], start_date, today_iso)
+    await _notify_achievements(callback.message, newly)
 
 
 @router.callback_query(F.data.startswith("delno:"))
@@ -594,7 +623,8 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
     if habit is None:
         await callback.answer("Не найдено.", show_alert=True)
         return
-    today = db.user_now(user["timezone"]).date()
+    now_dt = db.user_now(user["timezone"])
+    today = now_dt.date()
     if not db.is_required_today(
         habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
     ):
@@ -627,6 +657,13 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
             "Идеальный день! Все привычки на сегодня выполнены. "
             f"Бонус +{perfect['xp']} XP, +{perfect['coins']} {_coins_word(perfect['coins'])}."
         )
+
+    if result is not None:
+        newly = ach.check_all(
+            user["id"], now=now_dt, event="completion",
+            habit_id=habit_id, perfect_day=bool(perfect),
+        )
+        await _notify_achievements(callback.message, newly)
 
 
 @router.callback_query(F.data.startswith("stat:"))
@@ -761,6 +798,8 @@ async def shop_skip_buy(callback: CallbackQuery, state: FSMContext):
             f"Официальный пропуск для «{habit['title']}» на сегодня куплен. "
             "День нейтральный, серия сохранится."
         )
+        newly = ach.check_all(user["id"], event="purchase")
+        await _notify_achievements(callback.message, newly)
 
 
 @router.callback_query(F.data.startswith("replsel:"))
@@ -905,12 +944,23 @@ async def show_settings(message: Message):
     )
 
 
-PLACEHOLDER_BUTTONS = {kb.BTN_ACHIEVEMENTS}
-
-
-@router.message(F.text.in_(PLACEHOLDER_BUTTONS))
-async def placeholder(message: Message):
-    await message.answer("Этот раздел появится на следующих шагах сборки.")
+@router.message(F.text == kb.BTN_ACHIEVEMENTS)
+async def show_achievements(message: Message, state: FSMContext):
+    user = _active_user(message.from_user.id)
+    if user is None:
+        await message.answer("Сначала нажми /start и выбери часовой пояс.")
+        return
+    unlocked = db.get_unlocked_codes(user["id"])
+    got = sum(1 for a in ach.CATALOG if a["code"] in unlocked)
+    lines = [f"Достижения: {got} из {len(ach.CATALOG)}", ""]
+    for a in ach.CATALOG:
+        if a["code"] in unlocked:
+            lines.append(f"✅ {a['icon']} {a['title']} — {a['desc']}")
+        elif a["hidden"]:
+            lines.append("🔒 ??? — секрет")
+        else:
+            lines.append(f"🔒 {a['icon']} {a['title']} — {a['desc']}")
+    await message.answer("\n".join(lines))
 
 
 @router.message()

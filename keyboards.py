@@ -150,9 +150,12 @@ def stats_list_keyboard(habits) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def stat_card_keyboard() -> InlineKeyboardMarkup:
+def stat_card_keyboard(habit_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="stat_back")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Тепловая карта", callback_data=f"heat:{habit_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data="stat_back")],
+        ]
     )
 
 

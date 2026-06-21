@@ -29,6 +29,7 @@ def init_db() -> None:
             level        INTEGER NOT NULL DEFAULT 1,
             coins        INTEGER NOT NULL DEFAULT 0,
             freeze_count INTEGER NOT NULL DEFAULT 0,
+            pet_xp       INTEGER NOT NULL DEFAULT 0,
             created_at   TEXT
         )
     """)
@@ -96,6 +97,12 @@ def init_db() -> None:
             UNIQUE(user_id, date, event_type)
         )
     """)
+
+    # Миграция для существующих баз: добавить pet_xp, если колонки ещё нет.
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN pet_xp INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # колонка уже существует
 
     conn.commit()
     conn.close()
@@ -347,8 +354,8 @@ def complete_habit(habit_id: int, date_str: str) -> dict | None:
 
     owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
     conn.execute(
-        "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
-        (xp, coins, owner["user_id"]),
+        "UPDATE users SET xp = xp + ?, coins = coins + ?, pet_xp = pet_xp + ? WHERE id = ?",
+        (xp, coins, config.PET_GAIN_PER_COMPLETION, owner["user_id"]),
     )
 
     conn.commit()
@@ -869,12 +876,22 @@ def close_out_habit(habit_id: int, day_str: str) -> dict:
         conn.close()
         return {"result": "frozen", "user_id": user_id, "freeze_left": freeze - 1}
 
-    # обычный пропуск: штраф (не ниже 0) и обнуление серии
+    # обычный пропуск: штраф (не ниже 0), увядание питомца и обнуление серии
     conn.execute(
-        "UPDATE users SET coins = MAX(0, coins - ?) WHERE id = ?",
-        (config.COINS_PENALTY, user_id),
+        "UPDATE users SET coins = MAX(0, coins - ?), pet_xp = MAX(0, pet_xp - ?) WHERE id = ?",
+        (config.COINS_PENALTY, config.PET_LOSS_PER_MISS, user_id),
     )
     conn.execute("UPDATE habits SET current_streak = 0 WHERE id = ?", (habit_id,))
     conn.commit()
     conn.close()
     return {"result": "missed", "user_id": user_id, "prior_streak": prior_streak}
+
+
+def get_habit_logs(habit_id: int) -> list[sqlite3.Row]:
+    """Все логи привычки (дата, статус) — для тепловой карты."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT date, status FROM habit_logs WHERE habit_id = ?", (habit_id,)
+    ).fetchall()
+    conn.close()
+    return rows

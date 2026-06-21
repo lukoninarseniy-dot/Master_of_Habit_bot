@@ -7,12 +7,13 @@ from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 
 import config
 import database as db
 import keyboards as kb
 import achievements as ach
+import heatmap
 from scheduler import setup_scheduler, run_startup_catchup
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,15 @@ def _coins_word(n: int) -> str:
     if 2 <= d <= 4:
         return "монеты"
     return "монет"
+
+
+def pet_stage(pet_xp: int):
+    """Эмодзи и название стадии питомца по очкам роста."""
+    emoji, name = config.PET_STAGES[0][1], config.PET_STAGES[0][2]
+    for threshold, e, n in config.PET_STAGES:
+        if pet_xp >= threshold:
+            emoji, name = e, n
+    return emoji, name
 
 
 def _habit_stats_text(habit, user) -> str:
@@ -678,9 +688,30 @@ async def stat_open(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Не найдено.", show_alert=True)
         return
     await callback.message.edit_text(
-        _habit_stats_text(habit, user), reply_markup=kb.stat_card_keyboard()
+        _habit_stats_text(habit, user), reply_markup=kb.stat_card_keyboard(habit_id)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("heat:"))
+async def heatmap_handler(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    await callback.answer("Рисую…")
+    today = db.user_now(user["timezone"]).date()
+    logs = db.get_habit_logs(habit_id)
+    status_by_date = {r["date"]: r["status"] for r in logs}
+    png = heatmap.generate_heatmap(habit["title"], status_by_date, habit["start_date"], today)
+    await callback.message.answer_photo(
+        BufferedInputFile(png, filename="heatmap.png"),
+        caption=(
+            f"Тепловая карта: {habit['title']}\n"
+            "🟩 выполнено   🟥 пропуск   ⬜ нейтрально"
+        ),
+    )
 
 
 @router.callback_query(F.data == "stat_back")
@@ -967,13 +998,15 @@ async def show_balance(message: Message):
     level = db.level_from_xp(xp)
     next_threshold = 50 * level * (level + 1)
     remaining = next_threshold - xp
+    pet_emoji, pet_name = pet_stage(user["pet_xp"])
     await message.answer(
         "Баланс\n\n"
         f"Монеты: {user['coins']}\n"
         f"Опыт (XP): {xp}\n"
         f"Уровень: {level} ({level_title(level)})\n"
         f"До уровня {level + 1}: ещё {remaining} XP\n"
-        f"Заморозок серии: {user['freeze_count']}"
+        f"Заморозок серии: {user['freeze_count']}\n"
+        f"Питомец: {pet_emoji} {pet_name} (рост: {user['pet_xp']})"
     )
 
 

@@ -225,7 +225,18 @@ def delete_habit(habit_id: int) -> None:
 def is_required_today(
     schedule_type: str, schedule_data: str | None, start_date_str: str, today: date
 ) -> bool:
-    """Обязателен ли сегодня день для этой привычки."""
+    """Обязателен ли указанный день для этой привычки.
+
+    День раньше даты создания привычки (start_date) обязательным не считается —
+    это важно, чтобы планировщик не штрафовал за «пропуски» до появления привычки.
+    """
+    try:
+        start = date.fromisoformat(start_date_str)
+    except (TypeError, ValueError):
+        return False
+    if today < start:
+        return False
+
     if schedule_type == "daily":
         return True
 
@@ -236,11 +247,7 @@ def is_required_today(
             return False
         if n < 1:
             return False
-        start = date.fromisoformat(start_date_str)
-        delta = (today - start).days
-        if delta < 0:
-            return False
-        return delta % n == 0
+        return (today - start).days % n == 0
 
     if schedule_type == "weekdays":
         try:
@@ -331,3 +338,43 @@ def complete_habit(habit_id: int, date_str: str) -> dict | None:
         "coins": config.COINS_PER_COMPLETION,
         "streak": new_streak,
     }
+
+
+# =========================================================
+#  Для планировщика (Шаг 4)
+# =========================================================
+
+def get_all_users_with_tz() -> list[sqlite3.Row]:
+    """Все пользователи, у которых выбран часовой пояс (по ним работает планировщик)."""
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM users WHERE timezone IS NOT NULL").fetchall()
+    conn.close()
+    return rows
+
+
+def apply_miss(habit_id: int, date_str: str) -> bool:
+    """Помечает день пропущенным: штраф монетами (не ниже 0) и обнуление серии.
+
+    Возвращает True, если штраф применён сейчас. Если запись за этот день уже была
+    (выполнено / пропуск / штраф) — возвращает False и ничего не меняет.
+    Это и есть идемпотентность: повторная проверка того же дня не штрафует дважды.
+    """
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO habit_logs (habit_id, date, status, created_at) "
+        "VALUES (?, ?, 'missed', ?)",
+        (habit_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+
+    owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
+    conn.execute(
+        "UPDATE users SET coins = MAX(0, coins - ?) WHERE id = ?",
+        (config.COINS_PENALTY, owner["user_id"]),
+    )
+    conn.execute("UPDATE habits SET current_streak = 0 WHERE id = ?", (habit_id,))
+    conn.commit()
+    conn.close()
+    return True

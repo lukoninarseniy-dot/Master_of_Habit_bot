@@ -12,6 +12,7 @@ from aiogram.types import Message, CallbackQuery
 import config
 import database as db
 import keyboards as kb
+from scheduler import setup_scheduler, run_startup_catchup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -649,8 +650,16 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    # Планировщик: напоминания, вечерняя проверка в 22:00, штрафы в полночь.
+    scheduler = setup_scheduler(bot)
+    # Закрываем дни, пропущенные пока бот не работал (идемпотентно).
+    run_startup_catchup()
+
     logging.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":

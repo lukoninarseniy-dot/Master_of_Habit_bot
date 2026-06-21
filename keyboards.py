@@ -154,3 +154,47 @@ def stat_card_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="stat_back")]]
     )
+
+
+def shop_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"Официальный пропуск — {config.SHOP_OFFICIAL_SKIP_COST}",
+                callback_data="shop:skip",
+            )],
+            [InlineKeyboardButton(
+                text=f"Замена привычки на день — {config.SHOP_REPLACE_COST}",
+                callback_data="shop:replace",
+            )],
+        ]
+    )
+
+
+def shop_habits_keyboard(habits, action: str) -> InlineKeyboardMarkup:
+    """Список привычек для покупки. action: 'skip' или 'repl'."""
+    prefix = "skipsel" if action == "skip" else "replsel"
+    rows = [
+        [InlineKeyboardButton(text=h["title"], callback_data=f"{prefix}:{h['id']}")]
+        for h in habits
+    ]
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="shop_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def skip_confirm_keyboard(habit_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, купить", callback_data=f"skipbuy:{habit_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data="shop_back")],
+        ]
+    )
+
+
+def replace_text_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="repl_notext")],
+            [InlineKeyboardButton(text="Отмена", callback_data="fsm_cancel")],
+        ]
+    )

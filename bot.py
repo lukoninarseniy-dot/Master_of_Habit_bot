@@ -31,6 +31,10 @@ class HabitForm(StatesGroup):
     edit_time = State()
 
 
+class ShopForm(StatesGroup):
+    replace_text = State()  # ввод текста замены при покупке «замены на день»
+
+
 # =========================================================
 #  Вспомогательные функции
 # =========================================================
@@ -166,6 +170,37 @@ def _due_habits(user):
             continue
         due.append(h)
     return due
+
+
+def _shop_text(user) -> str:
+    return (
+        "Магазин\n"
+        f"Баланс: {user['coins']} {_coins_word(user['coins'])}\n\n"
+        "Выбери покупку:"
+    )
+
+
+async def _finalize_replacement(target: Message, state: FSMContext, telegram_id: int, alt_text):
+    data = await state.get_data()
+    habit_id = data["habit_id"]
+    habit, user = _owned_habit(habit_id, telegram_id)
+    await state.clear()
+    if habit is None:
+        await target.answer("Привычка не найдена.")
+        return
+    today = db.user_now(user["timezone"]).date().isoformat()
+    res = db.buy_replacement(user["id"], habit_id, today, alt_text)
+    if res["status"] == "no_coins":
+        await target.answer(f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.")
+    elif res["status"] == "already_logged":
+        await target.answer("За сегодня по этой привычке уже есть запись.")
+    else:
+        extra = f" Замена: {alt_text}." if alt_text else ""
+        await target.answer(
+            f"Замена для «{habit['title']}» засчитана как выполнение.{extra} "
+            f"Серия: {res['streak']} дн. Списано {res['cost']} {_coins_word(res['cost'])}.",
+            reply_markup=kb.main_menu(),
+        )
 
 
 async def _guard_menu(message: Message, state: FSMContext) -> bool:
@@ -343,6 +378,14 @@ async def edit_time_apply(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Время обновлено.")
     await _send_habit_card(message, data["habit_id"], message.from_user.id)
+
+
+@router.message(ShopForm.replace_text)
+async def shop_replace_text(message: Message, state: FSMContext):
+    if await _guard_menu(message, state):
+        return
+    alt = (message.text or "").strip()[:200] or None
+    await _finalize_replacement(message, state, message.from_user.id, alt)
 
 
 # Если в шагах выбора (тип расписания / дни недели) пользователь пишет текст вместо кнопки.
@@ -613,6 +656,146 @@ async def stat_back(callback: CallbackQuery, state: FSMContext):
 
 
 # =========================================================
+#  Магазин (inline-кнопки)
+# =========================================================
+
+@router.callback_query(F.data == "shop_back")
+async def shop_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user = db.get_user(callback.from_user.id)
+    await callback.message.edit_text(_shop_text(user), reply_markup=kb.shop_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "shop:skip")
+async def shop_skip(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    if user["coins"] < config.SHOP_OFFICIAL_SKIP_COST:
+        await callback.answer(
+            f"Недостаточно монет: нужно {config.SHOP_OFFICIAL_SKIP_COST}, у тебя {user['coins']}.",
+            show_alert=True,
+        )
+        return
+    due = _due_habits(user)
+    if not due:
+        await callback.message.edit_text(
+            "Сегодня нечего пропускать: всё отмечено или сегодня нет обязательных привычек.",
+            reply_markup=kb.shop_habits_keyboard([], "skip"),
+        )
+    else:
+        await callback.message.edit_text(
+            "Для какой привычки купить официальный пропуск на сегодня?",
+            reply_markup=kb.shop_habits_keyboard(due, "skip"),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "shop:replace")
+async def shop_replace(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    if user["coins"] < config.SHOP_REPLACE_COST:
+        await callback.answer(
+            f"Недостаточно монет: нужно {config.SHOP_REPLACE_COST}, у тебя {user['coins']}.",
+            show_alert=True,
+        )
+        return
+    due = _due_habits(user)
+    if not due:
+        await callback.message.edit_text(
+            "Сегодня нечего заменять: всё отмечено или сегодня нет обязательных привычек.",
+            reply_markup=kb.shop_habits_keyboard([], "repl"),
+        )
+    else:
+        await callback.message.edit_text(
+            "Какую привычку заменить на сегодня?",
+            reply_markup=kb.shop_habits_keyboard(due, "repl"),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("skipsel:"))
+async def shop_skip_select(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, _ = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Купить официальный пропуск для «{habit['title']}» на сегодня "
+        f"за {config.SHOP_OFFICIAL_SKIP_COST} монеты?\n\n"
+        "День станет нейтральным: штрафа не будет, серия сохранится, выполнение не засчитывается.",
+        reply_markup=kb.skip_confirm_keyboard(habit_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("skipbuy:"))
+async def shop_skip_buy(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    today = db.user_now(user["timezone"]).date()
+    if not db.is_required_today(
+        habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
+    ):
+        await callback.answer("Сегодня эта привычка не обязательна.", show_alert=True)
+        return
+    res = db.buy_official_skip(user["id"], habit_id, today.isoformat())
+    if res["status"] == "no_coins":
+        await callback.answer(
+            f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.", show_alert=True
+        )
+    elif res["status"] == "already_logged":
+        await callback.answer("За сегодня по этой привычке уже есть запись.", show_alert=True)
+    else:
+        await callback.answer(f"Куплено. Списано {res['cost']} {_coins_word(res['cost'])}.")
+        await callback.message.edit_text(
+            f"Официальный пропуск для «{habit['title']}» на сегодня куплен. "
+            "День нейтральный, серия сохранится."
+        )
+
+
+@router.callback_query(F.data.startswith("replsel:"))
+async def shop_replace_select(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    today = db.user_now(user["timezone"]).date()
+    if not db.is_required_today(
+        habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
+    ):
+        await callback.answer("Сегодня эта привычка не обязательна.", show_alert=True)
+        return
+    if db.get_log(habit_id, today.isoformat()) is not None:
+        await callback.answer("За сегодня по этой привычке уже есть запись.", show_alert=True)
+        return
+    await state.set_state(ShopForm.replace_text)
+    await state.update_data(habit_id=habit_id)
+    await callback.message.edit_text(
+        f"Замена для «{habit['title']}» на сегодня.\n"
+        "Напиши, чем заменяешь (коротко), или нажми «Пропустить».",
+        reply_markup=kb.replace_text_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(ShopForm.replace_text, F.data == "repl_notext")
+async def shop_replace_notext(callback: CallbackQuery, state: FSMContext):
+    await _finalize_replacement(callback.message, state, callback.from_user.id, None)
+    await callback.answer()
+
+
+# =========================================================
 #  Кнопки главного меню
 # =========================================================
 
@@ -681,6 +864,15 @@ async def show_stats(message: Message, state: FSMContext):
     await message.answer("Статистика по привычкам:", reply_markup=kb.stats_list_keyboard(habits))
 
 
+@router.message(F.text == kb.BTN_SHOP)
+async def open_shop(message: Message, state: FSMContext):
+    user = _active_user(message.from_user.id)
+    if user is None:
+        await message.answer("Сначала нажми /start и выбери часовой пояс.")
+        return
+    await message.answer(_shop_text(user), reply_markup=kb.shop_keyboard())
+
+
 @router.message(F.text == kb.BTN_BALANCE)
 async def show_balance(message: Message):
     user = _active_user(message.from_user.id)
@@ -713,7 +905,7 @@ async def show_settings(message: Message):
     )
 
 
-PLACEHOLDER_BUTTONS = {kb.BTN_SHOP, kb.BTN_ACHIEVEMENTS}
+PLACEHOLDER_BUTTONS = {kb.BTN_ACHIEVEMENTS}
 
 
 @router.message(F.text.in_(PLACEHOLDER_BUTTONS))

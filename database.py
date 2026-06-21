@@ -413,10 +413,20 @@ def try_award_perfect_day(user_id: int, date_str: str) -> dict | None:
     ]
     if not required:
         return None
+    did_something = False
     for h in required:
         log = get_log(h["id"], date_str)
-        if log is None or log["status"] not in ("completed", "temporary_replace"):
-            return None
+        if log is None:
+            return None  # обязательная, но день ещё не закрыт
+        status = log["status"]
+        if status == "official_skip":
+            continue  # нейтральный день — не мешает идеальному
+        if status in ("completed", "temporary_replace"):
+            did_something = True
+            continue
+        return None  # пропуск
+    if not did_something:
+        return None  # все обязательные были пропусками — это не «идеальный день»
 
     conn = get_connection()
     cur = conn.execute(
@@ -453,3 +463,81 @@ def get_habit_stats(habit_id: int) -> dict:
     missed = counts.get("missed", 0)
     skips = counts.get("official_skip", 0)
     return {"completed": completed, "missed": missed, "skips": skips}
+
+
+# =========================================================
+#  Магазин (Шаг 6)
+# =========================================================
+
+def buy_official_skip(user_id: int, habit_id: int, date_str: str) -> dict:
+    """Покупка официального пропуска на день: день нейтральный, штрафа нет, серия не рвётся.
+
+    Возвращает {"status": "ok"|"no_coins"|"already_logged", ...}.
+    """
+    conn = get_connection()
+    coins = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()["coins"]
+    if coins < config.SHOP_OFFICIAL_SKIP_COST:
+        conn.close()
+        return {"status": "no_coins", "have": coins, "need": config.SHOP_OFFICIAL_SKIP_COST}
+
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO habit_logs (habit_id, date, status, created_at) "
+        "VALUES (?, ?, 'official_skip', ?)",
+        (habit_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return {"status": "already_logged"}
+
+    conn.execute(
+        "UPDATE users SET coins = coins - ? WHERE id = ?",
+        (config.SHOP_OFFICIAL_SKIP_COST, user_id),
+    )
+    conn.execute(
+        "INSERT INTO shop_operations (user_id, operation_type, cost, habit_id, payload, created_at) "
+        "VALUES (?, 'official_skip', ?, ?, NULL, ?)",
+        (user_id, config.SHOP_OFFICIAL_SKIP_COST, habit_id, _now_utc_iso()),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "cost": config.SHOP_OFFICIAL_SKIP_COST}
+
+
+def buy_replacement(user_id: int, habit_id: int, date_str: str, alt_text: str | None) -> dict:
+    """Покупка замены привычки на день: засчитывается как выполнение, серия продолжается."""
+    conn = get_connection()
+    coins = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()["coins"]
+    if coins < config.SHOP_REPLACE_COST:
+        conn.close()
+        return {"status": "no_coins", "have": coins, "need": config.SHOP_REPLACE_COST}
+
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO habit_logs (habit_id, date, status, created_at) "
+        "VALUES (?, ?, 'temporary_replace', ?)",
+        (habit_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return {"status": "already_logged"}
+
+    # Замена засчитывается как выполнение — серия растёт.
+    conn.execute(
+        "UPDATE habits SET current_streak = current_streak + 1, "
+        "longest_streak = MAX(longest_streak, current_streak + 1) WHERE id = ?",
+        (habit_id,),
+    )
+    conn.execute(
+        "UPDATE users SET coins = coins - ? WHERE id = ?",
+        (config.SHOP_REPLACE_COST, user_id),
+    )
+    conn.execute(
+        "INSERT INTO shop_operations (user_id, operation_type, cost, habit_id, payload, created_at) "
+        "VALUES (?, 'replacement', ?, ?, ?, ?)",
+        (user_id, config.SHOP_REPLACE_COST, habit_id, alt_text, _now_utc_iso()),
+    )
+    new_streak = conn.execute(
+        "SELECT current_streak FROM habits WHERE id = ?", (habit_id,)
+    ).fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "cost": config.SHOP_REPLACE_COST, "streak": new_streak}

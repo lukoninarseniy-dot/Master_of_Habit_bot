@@ -85,6 +85,17 @@ def init_db() -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL REFERENCES users(id),
+            date       TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at TEXT,
+            UNIQUE(user_id, date, event_type)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -319,25 +330,29 @@ def complete_habit(habit_id: int, date_str: str) -> dict | None:
         "longest_streak = MAX(longest_streak, current_streak + 1) WHERE id = ?",
         (habit_id,),
     )
-
-    # Начисляем XP и монеты владельцу привычки.
-    owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
-    conn.execute(
-        "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
-        (config.XP_PER_COMPLETION, config.COINS_PER_COMPLETION, owner["user_id"]),
-    )
-
     new_streak = conn.execute(
         "SELECT current_streak FROM habits WHERE id = ?", (habit_id,)
     ).fetchone()[0]
 
+    # Базовое начисление + бонус за веху серии (7 / 14 / 30 / 100 дней).
+    xp = config.XP_PER_COMPLETION
+    coins = config.COINS_PER_COMPLETION
+    milestone = None
+    if new_streak in config.STREAK_MILESTONES:
+        m_xp, m_coins = config.STREAK_MILESTONES[new_streak]
+        xp += m_xp
+        coins += m_coins
+        milestone = new_streak
+
+    owner = conn.execute("SELECT user_id FROM habits WHERE id = ?", (habit_id,)).fetchone()
+    conn.execute(
+        "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
+        (xp, coins, owner["user_id"]),
+    )
+
     conn.commit()
     conn.close()
-    return {
-        "xp": config.XP_PER_COMPLETION,
-        "coins": config.COINS_PER_COMPLETION,
-        "streak": new_streak,
-    }
+    return {"xp": xp, "coins": coins, "streak": new_streak, "milestone": milestone}
 
 
 # =========================================================
@@ -378,3 +393,63 @@ def apply_miss(habit_id: int, date_str: str) -> bool:
     conn.commit()
     conn.close()
     return True
+
+
+# =========================================================
+#  Идеальный день и статистика (Шаг 5)
+# =========================================================
+
+def try_award_perfect_day(user_id: int, date_str: str) -> dict | None:
+    """Если ВСЕ обязательные сегодня привычки выполнены — выдаёт бонус «идеальный день».
+
+    Идемпотентно: не больше одного такого бонуса в день (таблица daily_events).
+    Возвращает начисление или None.
+    """
+    day = date.fromisoformat(date_str)
+    habits = [h for h in get_habits(user_id) if not h["is_paused"]]
+    required = [
+        h for h in habits
+        if is_required_today(h["schedule_type"], h["schedule_data"], h["start_date"], day)
+    ]
+    if not required:
+        return None
+    for h in required:
+        log = get_log(h["id"], date_str)
+        if log is None or log["status"] not in ("completed", "temporary_replace"):
+            return None
+
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO daily_events (user_id, date, event_type, created_at) "
+        "VALUES (?, ?, 'perfect_day', ?)",
+        (user_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return None
+    conn.execute(
+        "UPDATE users SET xp = xp + ?, coins = coins + ? WHERE id = ?",
+        (config.XP_PERFECT_DAY, config.COINS_PERFECT_DAY, user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"xp": config.XP_PERFECT_DAY, "coins": config.COINS_PERFECT_DAY}
+
+
+def get_habit_stats(habit_id: int) -> dict:
+    """Сводка по логам привычки для экрана статистики.
+
+    Временная замена (когда появится на Шаге 6) считается как выполнение,
+    официальный пропуск — как нейтральный день.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS c FROM habit_logs WHERE habit_id = ? GROUP BY status",
+        (habit_id,),
+    ).fetchall()
+    conn.close()
+    counts = {r["status"]: r["c"] for r in rows}
+    completed = counts.get("completed", 0) + counts.get("temporary_replace", 0)
+    missed = counts.get("missed", 0)
+    skips = counts.get("official_skip", 0)
+    return {"completed": completed, "missed": missed, "skips": skips}

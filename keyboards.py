@@ -139,3 +139,18 @@ def due_habits_keyboard(habits) -> InlineKeyboardMarkup:
         for h in habits
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def stats_list_keyboard(habits) -> InlineKeyboardMarkup:
+    """Список привычек для экрана статистики."""
+    rows = [
+        [InlineKeyboardButton(text=h["title"], callback_data=f"stat:{h['id']}")]
+        for h in habits
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def stat_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="stat_back")]]
+    )

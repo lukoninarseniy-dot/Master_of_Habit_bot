@@ -50,6 +50,48 @@ def level_title(level: int) -> str:
     return "Новичок"
 
 
+def level_from_xp(xp: int) -> int:
+    """Уровень по XP. Чтобы достичь уровня L, нужно накопить 50*(L-1)*L XP."""
+    level = 1
+    while 50 * level * (level + 1) <= xp:
+        level += 1
+    return level
+
+
+def _coins_word(n: int) -> str:
+    """Склонение слова «монета» по числу."""
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return "монет"
+    d = n % 10
+    if d == 1:
+        return "монета"
+    if 2 <= d <= 4:
+        return "монеты"
+    return "монет"
+
+
+def _habit_stats_text(habit, user) -> str:
+    s = db.get_habit_stats(habit["id"])
+    completed, missed, skips = s["completed"], s["missed"], s["skips"]
+    active = completed + missed + skips
+    denom = completed + missed  # обязательные дни минус официальные пропуски
+    percent = f"{round(completed / denom * 100)}%" if denom > 0 else "—"
+    level = level_from_xp(user["xp"])
+    return (
+        f"{habit['title']}\n\n"
+        f"Активных дней: {active}\n"
+        f"Выполнено: {completed}\n"
+        f"Пропущено: {missed}\n"
+        f"Официальных пропусков: {skips}\n"
+        f"Текущая серия: {habit['current_streak']} дн.\n"
+        f"Лучшая серия: {habit['longest_streak']} дн.\n\n"
+        f"Процент выполнения: {percent}\n\n"
+        f"Текущий баланс: {user['coins']} {_coins_word(user['coins'])}\n"
+        f"Уровень: {level} ({level_title(level)})"
+    )
+
+
 def _parse_hhmm(text: str) -> str | None:
     """Проверяет время в формате ЧЧ:ММ. Принимает '8:30' и '08:30', возвращает '08:30'."""
     parts = (text or "").strip().split(":")
@@ -516,12 +558,19 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сегодня эта привычка не обязательна.", show_alert=True)
         return
     result = db.complete_habit(habit_id, today.isoformat())
+    perfect = None
     if result is None:
         await callback.answer("Уже отмечено сегодня.", show_alert=True)
     else:
-        await callback.answer(
-            f"+{result['xp']} XP, +{result['coins']} монета. Серия: {result['streak']} дн."
+        toast = (
+            f"+{result['xp']} XP, +{result['coins']} {_coins_word(result['coins'])}. "
+            f"Серия: {result['streak']} дн."
         )
+        if result["milestone"]:
+            toast += " Веха серии!"
+        await callback.answer(toast)
+        perfect = db.try_award_perfect_day(user["id"], today.isoformat())
+
     due = _due_habits(user)
     if not due:
         await callback.message.edit_text("Готово. Все привычки на сегодня отмечены.")
@@ -529,6 +578,38 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             "Отметь выполненные за сегодня:", reply_markup=kb.due_habits_keyboard(due)
         )
+
+    if perfect:
+        await callback.message.answer(
+            "Идеальный день! Все привычки на сегодня выполнены. "
+            f"Бонус +{perfect['xp']} XP, +{perfect['coins']} {_coins_word(perfect['coins'])}."
+        )
+
+
+@router.callback_query(F.data.startswith("stat:"))
+async def stat_open(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        _habit_stats_text(habit, user), reply_markup=kb.stat_card_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "stat_back")
+async def stat_back(callback: CallbackQuery, state: FSMContext):
+    user = db.get_user(callback.from_user.id)
+    habits = db.get_habits(user["id"]) if user else []
+    if not habits:
+        await callback.message.edit_text("Сначала добавь привычки.")
+    else:
+        await callback.message.edit_text(
+            "Статистика по привычкам:", reply_markup=kb.stats_list_keyboard(habits)
+        )
+    await callback.answer()
 
 
 # =========================================================
@@ -587,17 +668,35 @@ async def check_menu(message: Message, state: FSMContext):
     )
 
 
+@router.message(F.text == kb.BTN_STATS)
+async def show_stats(message: Message, state: FSMContext):
+    user = _active_user(message.from_user.id)
+    if user is None:
+        await message.answer("Сначала нажми /start и выбери часовой пояс.")
+        return
+    habits = db.get_habits(user["id"])
+    if not habits:
+        await message.answer("Сначала добавь привычки.")
+        return
+    await message.answer("Статистика по привычкам:", reply_markup=kb.stats_list_keyboard(habits))
+
+
 @router.message(F.text == kb.BTN_BALANCE)
 async def show_balance(message: Message):
     user = _active_user(message.from_user.id)
     if user is None:
         await message.answer("Сначала нажми /start и выбери часовой пояс.")
         return
+    xp = user["xp"]
+    level = level_from_xp(xp)
+    next_threshold = 50 * level * (level + 1)
+    remaining = next_threshold - xp
     await message.answer(
         "Баланс\n\n"
         f"Монеты: {user['coins']}\n"
-        f"Опыт (XP): {user['xp']}\n"
-        f"Уровень: {user['level']} ({level_title(user['level'])})"
+        f"Опыт (XP): {xp}\n"
+        f"Уровень: {level} ({level_title(level)})\n"
+        f"До уровня {level + 1}: ещё {remaining} XP"
     )
 
 
@@ -614,7 +713,7 @@ async def show_settings(message: Message):
     )
 
 
-PLACEHOLDER_BUTTONS = {kb.BTN_STATS, kb.BTN_SHOP, kb.BTN_ACHIEVEMENTS}
+PLACEHOLDER_BUTTONS = {kb.BTN_SHOP, kb.BTN_ACHIEVEMENTS}
 
 
 @router.message(F.text.in_(PLACEHOLDER_BUTTONS))

@@ -703,12 +703,37 @@ async def pause_habit(callback: CallbackQuery, state: FSMContext):
     if habit is None:
         await callback.answer("Не найдено.", show_alert=True)
         return
+    if habit["current_streak"] > 0:
+        # Серия не нулевая — предупреждаем, что пауза её обнулит.
+        await callback.message.edit_text(
+            f"Поставить «{habit['title']}» на паузу?\n\n"
+            f"Текущая серия ({habit['current_streak']} дн.) обнулится. "
+            "Если нужен перерыв с сохранением серии — используй пропуск или заморозку из магазина.",
+            reply_markup=kb.pause_confirm_keyboard(habit_id),
+        )
+        await callback.answer()
+        return
     db.set_paused(habit_id, 1)
     habit, user = _owned_habit(habit_id, callback.from_user.id)
     await callback.message.edit_text(
         _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
     )
     await callback.answer("Привычка на паузе: без напоминаний и штрафов.")
+
+
+@router.callback_query(F.data.startswith("pauseyes:"))
+async def pause_habit_confirm(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    db.set_paused(habit_id, 1)
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    await callback.message.edit_text(
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
+    )
+    await callback.answer("Привычка на паузе. Серия обнулена.")
 
 
 @router.callback_query(F.data.startswith("resume:"))
@@ -1081,60 +1106,6 @@ async def shop_luck_buy(callback: CallbackQuery, state: FSMContext):
     )
     newly = ach.check_all(user["id"], event="purchase")
     await _finish_turn(callback.message, user["id"], newly)
-
-
-@router.callback_query(F.data == "shop:reset")
-async def shop_reset(callback: CallbackQuery, state: FSMContext):
-    user = _active_user(callback.from_user.id)
-    if user is None:
-        await callback.answer("Не найдено.", show_alert=True)
-        return
-    habits = db.get_habits(user["id"])
-    if not habits:
-        await callback.answer("У тебя пока нет привычек.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"Полный сброс привычки за {config.SHOP_RESET_COST} монет.\n\n"
-        "Вся история привычки будет стёрта, серия обнулится, отсчёт начнётся заново. "
-        "Выбери привычку:",
-        reply_markup=kb.shop_habits_keyboard(habits, "reset"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("resetsel:"))
-async def shop_reset_select(callback: CallbackQuery, state: FSMContext):
-    habit_id = int(callback.data.split(":", 1)[1])
-    habit, user = _owned_habit(habit_id, callback.from_user.id)
-    if habit is None:
-        await callback.answer("Не найдено.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"Точно сбросить историю привычки «{habit['title']}»?\n"
-        f"Это нельзя отменить. Спишется {config.SHOP_RESET_COST} монет.",
-        reply_markup=kb.reset_confirm_keyboard(habit_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("resetbuy:"))
-async def shop_reset_buy(callback: CallbackQuery, state: FSMContext):
-    habit_id = int(callback.data.split(":", 1)[1])
-    habit, user = _owned_habit(habit_id, callback.from_user.id)
-    if habit is None:
-        await callback.answer("Не найдено.", show_alert=True)
-        return
-    today = db.user_now(user["timezone"]).date().isoformat()
-    res = db.reset_habit(user["id"], habit_id, today)
-    if res["status"] == "no_coins":
-        await callback.answer(
-            f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.", show_alert=True
-        )
-        return
-    await callback.answer(f"Сброшено. Списано {res['cost']} {_coins_word(res['cost'])}.")
-    await callback.message.edit_text(
-        f"История привычки «{habit['title']}» обнулена. Отсчёт начинается заново."
-    )
 
 
 # =========================================================

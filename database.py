@@ -933,7 +933,14 @@ def count_completions_in_category(user_id: int, category: str) -> int:
 
 def set_paused(habit_id: int, value: int) -> None:
     conn = get_connection()
-    conn.execute("UPDATE habits SET is_paused = ? WHERE id = ?", (1 if value else 0, habit_id))
+    if value:
+        # Пауза обнуляет текущую серию — иначе пауза бесплатно заменяла бы
+        # платные пропуск/заморозку, которые как раз сохраняют серию.
+        conn.execute(
+            "UPDATE habits SET is_paused = 1, current_streak = 0 WHERE id = ?", (habit_id,)
+        )
+    else:
+        conn.execute("UPDATE habits SET is_paused = 0 WHERE id = ?", (habit_id,))
     conn.commit()
     conn.close()
 

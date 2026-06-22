@@ -185,10 +185,6 @@ def shop_keyboard() -> InlineKeyboardMarkup:
                 text=f"Сундук удачи — {config.SHOP_LUCK_CHEST_COST}",
                 callback_data="shop:luck",
             )],
-            [InlineKeyboardButton(
-                text=f"Полный сброс привычки — {config.SHOP_RESET_COST}",
-                callback_data="shop:reset",
-            )],
         ]
     )
 
@@ -203,8 +199,8 @@ def freeze_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def shop_habits_keyboard(habits, action: str) -> InlineKeyboardMarkup:
-    """Список привычек для покупки. action: 'skip', 'repl' или 'reset'."""
-    prefix = {"skip": "skipsel", "repl": "replsel", "reset": "resetsel"}[action]
+    """Список привычек для покупки. action: 'skip' или 'repl'."""
+    prefix = {"skip": "skipsel", "repl": "replsel"}[action]
     rows = [
         [InlineKeyboardButton(text=h["title"], callback_data=f"{prefix}:{h['id']}")]
         for h in habits
@@ -268,10 +264,10 @@ def luck_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def reset_confirm_keyboard(habit_id: int) -> InlineKeyboardMarkup:
+def pause_confirm_keyboard(habit_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Да, сбросить историю", callback_data=f"resetbuy:{habit_id}")],
-            [InlineKeyboardButton(text="Назад", callback_data="shop_back")],
+            [InlineKeyboardButton(text="Да, на паузу", callback_data=f"pauseyes:{habit_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data=f"habit:{habit_id}")],
         ]
     )

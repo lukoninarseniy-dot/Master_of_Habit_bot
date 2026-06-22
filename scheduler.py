@@ -14,11 +14,13 @@ from apscheduler.triggers.cron import CronTrigger
 
 import database as db
 import achievements as ach
+import config
 
 logger = logging.getLogger(__name__)
 
 LOOKBACK_DAYS = 30   # на сколько дней назад «доштрафовать» после простоя бота
 EVENING_HOUR = 22    # час вечерней проверки
+WEEKLY_SUMMARY_HOUR = config.WEEKLY_SUMMARY_HOUR  # час воскресной сводки
 
 # Защита от повторной отправки одного и того же сообщения в рамках процесса.
 _sent_keys: set[str] = set()
@@ -166,6 +168,30 @@ async def _process_user(bot, user) -> None:
     # Вечерняя проверка.
     if hhmm == f"{EVENING_HOUR:02d}:00":
         await _evening_check(bot, user, today)
+
+    # Воскресная еженедельная сводка.
+    if today.weekday() == 6 and hhmm == f"{WEEKLY_SUMMARY_HOUR:02d}:00":
+        await _weekly_summary(bot, user, today)
+
+
+async def _weekly_summary(bot, user, today) -> None:
+    if _seen(f"weekly:{user['id']}:{today.isoformat()}"):
+        return
+    s = db.weekly_summary(user["id"], today.isoformat())
+    if s["completions"] == 0 and s["new_achievements"] == 0:
+        return  # нечего показывать — не беспокоим
+    lines = [
+        "Итоги недели:",
+        f"Выполнений за 7 дней: {s['completions']}",
+        f"Лучшая текущая серия: {s['best_streak']} дн.",
+        f"Новых достижений: {s['new_achievements']}",
+    ]
+    if s["top_mood"]:
+        lines.append(f"Настроение чаще всего: {s['top_mood']}")
+    try:
+        await bot.send_message(user["telegram_id"], "\n".join(lines))
+    except Exception:
+        logger.exception("Не удалось отправить сводку %s", user["telegram_id"])
 
 
 async def _tick(bot) -> None:

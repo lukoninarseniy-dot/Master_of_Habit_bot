@@ -1,4 +1,5 @@
 import json
+import random
 import sqlite3
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -170,13 +171,14 @@ def add_habit(
     schedule_data: str | None,
     reminder_time: str,
     start_date: str,
+    category: str | None = None,
 ) -> int:
     conn = get_connection()
     cur = conn.execute(
         """INSERT INTO habits
-           (user_id, title, schedule_type, schedule_data, reminder_time, start_date, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, title, schedule_type, schedule_data, reminder_time, start_date, _now_utc_iso()),
+           (user_id, title, category, schedule_type, schedule_data, reminder_time, start_date, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, title, category, schedule_type, schedule_data, reminder_time, start_date, _now_utc_iso()),
     )
     conn.commit()
     habit_id = cur.lastrowid
@@ -895,3 +897,177 @@ def get_habit_logs(habit_id: int) -> list[sqlite3.Row]:
     ).fetchall()
     conn.close()
     return rows
+
+
+# =========================================================
+#  Фаза 2: категории, пауза, настроение, сундуки, сброс, сводка
+# =========================================================
+
+def update_habit_category(habit_id: int, category: str | None) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE habits SET category = ? WHERE id = ?", (category, habit_id))
+    conn.commit()
+    conn.close()
+
+
+def count_distinct_categories(user_id: int) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(DISTINCT category) FROM habits WHERE user_id = ? AND category IS NOT NULL",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def count_completions_in_category(user_id: int, category: str) -> int:
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND h.category = ? AND l.status IN ('completed', 'temporary_replace')",
+        (user_id, category),
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def set_paused(habit_id: int, value: int) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE habits SET is_paused = ? WHERE id = ?", (1 if value else 0, habit_id))
+    conn.commit()
+    conn.close()
+
+
+def set_mood(habit_id: int, date_str: str, mood: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE habit_logs SET mood = ? WHERE habit_id = ? AND date = ?",
+        (mood, habit_id, date_str),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mood_counts(habit_id: int) -> dict:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT mood, COUNT(*) AS c FROM habit_logs WHERE habit_id = ? AND mood IS NOT NULL GROUP BY mood",
+        (habit_id,),
+    ).fetchall()
+    conn.close()
+    return {r["mood"]: r["c"] for r in rows}
+
+
+def has_event(user_id: int, event_type: str) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM daily_events WHERE user_id = ? AND event_type = ? LIMIT 1",
+        (user_id, event_type),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def try_daily_chest(user_id: int, date_str: str) -> dict | None:
+    """Ежедневный сундук за первое выполнение дня. Один раз в день (идемпотентно)."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO daily_events (user_id, date, event_type, created_at) "
+        "VALUES (?, ?, 'daily_chest', ?)",
+        (user_id, date_str, _now_utc_iso()),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return None
+    reward = random.randint(config.DAILY_CHEST_MIN, config.DAILY_CHEST_MAX)
+    conn.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (reward, user_id))
+    is_max = reward == config.DAILY_CHEST_MAX
+    if is_max:
+        conn.execute(
+            "INSERT OR IGNORE INTO daily_events (user_id, date, event_type, created_at) "
+            "VALUES (?, ?, 'daily_chest_max', ?)",
+            (user_id, date_str, _now_utc_iso()),
+        )
+    conn.commit()
+    conn.close()
+    return {"coins": reward, "is_max": is_max}
+
+
+def buy_luck_chest(user_id: int) -> dict:
+    """Сундук удачи в магазине: платишь фикс, получаешь случайно (азарт)."""
+    conn = get_connection()
+    coins = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()["coins"]
+    if coins < config.SHOP_LUCK_CHEST_COST:
+        conn.close()
+        return {"status": "no_coins", "have": coins, "need": config.SHOP_LUCK_CHEST_COST}
+    won = random.randint(config.LUCK_CHEST_MIN, config.LUCK_CHEST_MAX)
+    conn.execute(
+        "UPDATE users SET coins = coins - ? + ? WHERE id = ?",
+        (config.SHOP_LUCK_CHEST_COST, won, user_id),
+    )
+    conn.execute(
+        "INSERT INTO shop_operations (user_id, operation_type, cost, habit_id, payload, created_at) "
+        "VALUES (?, 'luck_chest', ?, NULL, ?, ?)",
+        (user_id, config.SHOP_LUCK_CHEST_COST, str(won), _now_utc_iso()),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "cost": config.SHOP_LUCK_CHEST_COST, "won": won}
+
+
+def reset_habit(user_id: int, habit_id: int, today_str: str) -> dict:
+    """Полный сброс привычки: стирает историю, обнуляет серии, старт с сегодня."""
+    conn = get_connection()
+    coins = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()["coins"]
+    if coins < config.SHOP_RESET_COST:
+        conn.close()
+        return {"status": "no_coins", "have": coins, "need": config.SHOP_RESET_COST}
+    conn.execute("DELETE FROM habit_logs WHERE habit_id = ?", (habit_id,))
+    conn.execute(
+        "UPDATE habits SET current_streak = 0, longest_streak = 0, start_date = ?, is_paused = 0 "
+        "WHERE id = ?",
+        (today_str, habit_id),
+    )
+    conn.execute("UPDATE users SET coins = coins - ? WHERE id = ?", (config.SHOP_RESET_COST, user_id))
+    conn.execute(
+        "INSERT INTO shop_operations (user_id, operation_type, cost, habit_id, payload, created_at) "
+        "VALUES (?, 'reset', ?, ?, NULL, ?)",
+        (user_id, config.SHOP_RESET_COST, habit_id, _now_utc_iso()),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "cost": config.SHOP_RESET_COST}
+
+
+def weekly_summary(user_id: int, today_str: str) -> dict:
+    """Сводка за последние 7 дней (включая сегодня)."""
+    today = date.fromisoformat(today_str)
+    week_start = (today - timedelta(days=6)).isoformat()
+    conn = get_connection()
+    completions = conn.execute(
+        "SELECT COUNT(*) FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.status IN ('completed', 'temporary_replace') "
+        "AND l.date >= ? AND l.date <= ?",
+        (user_id, week_start, today_str),
+    ).fetchone()[0]
+    best_streak = conn.execute(
+        "SELECT MAX(current_streak) AS m FROM habits WHERE user_id = ?", (user_id,)
+    ).fetchone()["m"] or 0
+    new_achievements = conn.execute(
+        "SELECT COUNT(*) FROM user_achievements WHERE user_id = ? AND substr(unlocked_at, 1, 10) >= ?",
+        (user_id, week_start),
+    ).fetchone()[0]
+    mood_rows = conn.execute(
+        "SELECT mood, COUNT(*) AS c FROM habit_logs l JOIN habits h ON l.habit_id = h.id "
+        "WHERE h.user_id = ? AND l.mood IS NOT NULL AND l.date >= ? AND l.date <= ? "
+        "GROUP BY mood ORDER BY c DESC LIMIT 1",
+        (user_id, week_start, today_str),
+    ).fetchone()
+    conn.close()
+    top_mood = mood_rows["mood"] if mood_rows else None
+    return {
+        "completions": completions,
+        "best_streak": best_streak,
+        "new_achievements": new_achievements,
+        "top_mood": top_mood,
+    }

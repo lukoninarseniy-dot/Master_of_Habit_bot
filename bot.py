@@ -24,6 +24,7 @@ router = Router()
 class HabitForm(StatesGroup):
     # Добавление
     title = State()
+    category = State()
     schedule_type = State()
     schedule_n = State()
     weekdays = State()
@@ -85,15 +86,22 @@ def _habit_stats_text(habit, user) -> str:
     denom = completed + missed  # обязательные дни минус официальные пропуски
     percent = f"{round(completed / denom * 100)}%" if denom > 0 else "—"
     level = db.level_from_xp(user["xp"])
+    category = habit["category"] or "—"
+    moods = db.mood_counts(habit["id"])
+    mood_line = (
+        "  ".join(f"{m} {c}" for m, c in moods.items()) if moods else "нет отметок"
+    )
     return (
         f"{habit['title']}\n\n"
+        f"Категория: {category}\n"
         f"Активных дней: {active}\n"
         f"Выполнено: {completed}\n"
         f"Пропущено: {missed}\n"
         f"Официальных пропусков: {skips}\n"
         f"Текущая серия: {habit['current_streak']} дн.\n"
         f"Лучшая серия: {habit['longest_streak']} дн.\n\n"
-        f"Процент выполнения: {percent}\n\n"
+        f"Процент выполнения: {percent}\n"
+        f"Настроение: {mood_line}\n\n"
         f"Текущий баланс: {user['coins']} {_coins_word(user['coins'])}\n"
         f"Уровень: {level} ({level_title(level)})"
     )
@@ -132,19 +140,28 @@ def _owned_habit(habit_id: int, telegram_id: int):
 
 def _habit_card_text(habit, user) -> str:
     today = db.user_now(user["timezone"]).date()
-    required = db.is_required_today(
-        habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
-    )
-    log = db.get_log(habit["id"], today.isoformat())
-    if log is not None and log["status"] == "completed":
-        status = "выполнено сегодня"
-    elif required:
-        status = "сегодня нужно выполнить"
-    else:
-        status = "сегодня выполнять не нужно"
+    category = habit["category"] or "—"
     reminder = habit["reminder_time"] if habit["reminder_time"] else "выкл"
+    if habit["is_paused"]:
+        status = "на паузе"
+    else:
+        log = db.get_log(habit["id"], today.isoformat())
+        required = db.is_required_today(
+            habit["schedule_type"], habit["schedule_data"], habit["start_date"], today
+        )
+        if log is not None and log["status"] in ("completed", "temporary_replace"):
+            status = "выполнено сегодня"
+        elif log is not None and log["status"] == "official_skip":
+            status = "официальный пропуск"
+        elif log is not None and log["status"] == "freeze":
+            status = "заморозка (серия сохранена)"
+        elif required:
+            status = "сегодня нужно выполнить"
+        else:
+            status = "сегодня выполнять не нужно"
     return (
         f"{habit['title']}\n\n"
+        f"Категория: {category}\n"
         f"Расписание: {db.format_schedule(habit['schedule_type'], habit['schedule_data'])}\n"
         f"Напоминание: {reminder}\n"
         f"Текущая серия: {habit['current_streak']} дн.\n"
@@ -157,7 +174,7 @@ async def _send_habit_card(target: Message, habit_id: int, telegram_id: int) -> 
     if habit is None:
         await target.answer("Привычка не найдена.")
         return
-    await target.answer(_habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id))
+    await target.answer(_habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"]))
 
 
 def _due_habits(user):
@@ -205,6 +222,12 @@ async def _finalize_replacement(target: Message, state: FSMContext, telegram_id:
             f"Серия: {res['streak']} дн. Списано {res['cost']} {_coins_word(res['cost'])}.",
             reply_markup=kb.main_menu(),
         )
+        chest = db.try_daily_chest(user["id"], today)
+        if chest:
+            chest_extra = " Максимум!" if chest["is_max"] else ""
+            await target.answer(
+                f"Ежедневный сундук: +{chest['coins']} {_coins_word(chest['coins'])}.{chest_extra}"
+            )
         newly = ach.check_all(
             user["id"], now=db.user_now(user["timezone"]), event="completion", habit_id=habit_id
         )
@@ -332,8 +355,8 @@ async def add_title(message: Message, state: FSMContext):
         )
         return
     await state.update_data(title=title)
-    await state.set_state(HabitForm.schedule_type)
-    await message.answer("Как часто выполнять?", reply_markup=kb.schedule_type_keyboard())
+    await state.set_state(HabitForm.category)
+    await message.answer("Выбери категорию:", reply_markup=kb.category_keyboard("cat"))
 
 
 @router.message(HabitForm.schedule_n)
@@ -368,11 +391,13 @@ async def add_reminder_time(message: Message, state: FSMContext):
     user = db.get_user(message.from_user.id)
     today = db.user_now(user["timezone"]).date().isoformat()
     db.add_habit(
-        user["id"], data["title"], data["schedule_type"], data.get("schedule_data"), t, today
+        user["id"], data["title"], data["schedule_type"], data.get("schedule_data"), t, today,
+        category=data.get("category"),
     )
     await state.clear()
     await message.answer(
         f"Привычка «{data['title']}» добавлена.\n"
+        f"Категория: {data.get('category') or '—'}\n"
         f"Расписание: {db.format_schedule(data['schedule_type'], data.get('schedule_data'))}\n"
         f"Напоминание: {t}",
         reply_markup=kb.main_menu(),
@@ -425,10 +450,21 @@ async def shop_replace_text(message: Message, state: FSMContext):
     await _finalize_replacement(message, state, message.from_user.id, alt)
 
 
-# Если в шагах выбора (тип расписания / дни недели) пользователь пишет текст вместо кнопки.
-@router.message(StateFilter(HabitForm.schedule_type, HabitForm.weekdays))
+# Если в шагах выбора (тип расписания / дни недели / категория) пишут текст вместо кнопки.
+@router.message(StateFilter(HabitForm.schedule_type, HabitForm.weekdays, HabitForm.category))
 async def schedule_use_buttons(message: Message, state: FSMContext):
     await message.answer("Пожалуйста, выбери вариант кнопками выше или нажми /cancel.")
+
+
+@router.callback_query(HabitForm.category, F.data.startswith("cat:"))
+async def choose_category(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split(":", 1)[1])
+    category = config.CATEGORIES[idx]
+    await state.update_data(category=category)
+    await state.set_state(HabitForm.schedule_type)
+    await callback.message.edit_text(f"Категория: {category}")
+    await callback.message.answer("Как часто выполнять?", reply_markup=kb.schedule_type_keyboard())
+    await callback.answer()
 
 
 # =========================================================
@@ -492,11 +528,13 @@ async def reminder_off(callback: CallbackQuery, state: FSMContext):
         user = db.get_user(callback.from_user.id)
         today = db.user_now(user["timezone"]).date().isoformat()
         db.add_habit(
-            user["id"], data["title"], data["schedule_type"], data.get("schedule_data"), None, today
+            user["id"], data["title"], data["schedule_type"], data.get("schedule_data"), None, today,
+            category=data.get("category"),
         )
         await state.clear()
         await callback.message.edit_text(
             f"Привычка «{data['title']}» добавлена.\n"
+            f"Категория: {data.get('category') or '—'}\n"
             f"Расписание: {db.format_schedule(data['schedule_type'], data.get('schedule_data'))}\n"
             "Напоминание: выкл."
         )
@@ -524,7 +562,7 @@ async def open_habit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Привычка не найдена.", show_alert=True)
         return
     await callback.message.edit_text(
-        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id)
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
     )
     await callback.answer()
 
@@ -625,9 +663,69 @@ async def delete_no(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Не найдено.", show_alert=True)
         return
     await callback.message.edit_text(
-        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id)
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ecat:"))
+async def edit_category_start(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, _ = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    await callback.message.answer(
+        "Выбери новую категорию:", reply_markup=kb.category_keyboard("ecatset", habit_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ecatset:"))
+async def edit_category_apply(callback: CallbackQuery, state: FSMContext):
+    _, hid, idx = callback.data.split(":")
+    habit, user = _owned_habit(int(hid), callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    db.update_habit_category(int(hid), config.CATEGORIES[int(idx)])
+    habit, user = _owned_habit(int(hid), callback.from_user.id)
+    await callback.message.edit_text(
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(int(hid), habit["is_paused"])
+    )
+    await callback.answer("Категория обновлена.")
+
+
+@router.callback_query(F.data.startswith("pause:"))
+async def pause_habit(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    db.set_paused(habit_id, 1)
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    await callback.message.edit_text(
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
+    )
+    await callback.answer("Привычка на паузе: без напоминаний и штрафов.")
+
+
+@router.callback_query(F.data.startswith("resume:"))
+async def resume_habit(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    db.set_paused(habit_id, 0)
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    await callback.message.edit_text(
+        _habit_card_text(habit, user), reply_markup=kb.habit_card_keyboard(habit_id, habit["is_paused"])
+    )
+    await callback.answer("Привычка возобновлена.")
+    newly = ach.check_all(user["id"], event="resume")
+    await _finish_turn(callback.message, user["id"], newly)
 
 
 @router.callback_query(F.data.startswith("done:"))
@@ -646,6 +744,7 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
         return
     result = db.complete_habit(habit_id, today.isoformat())
     perfect = None
+    chest = None
     if result is None:
         await callback.answer("Уже отмечено сегодня.", show_alert=True)
     else:
@@ -657,6 +756,7 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
             toast += " Веха серии!"
         await callback.answer(toast)
         perfect = db.try_award_perfect_day(user["id"], today.isoformat())
+        chest = db.try_daily_chest(user["id"], today.isoformat())
 
     due = _due_habits(user)
     if not due:
@@ -664,6 +764,12 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
     else:
         await callback.message.edit_text(
             "Отметь выполненные за сегодня:", reply_markup=kb.due_habits_keyboard(due)
+        )
+
+    if chest:
+        extra = " Максимум!" if chest["is_max"] else ""
+        await callback.message.answer(
+            f"Ежедневный сундук: +{chest['coins']} {_coins_word(chest['coins'])}.{extra}"
         )
 
     if perfect:
@@ -678,6 +784,29 @@ async def mark_done(callback: CallbackQuery, state: FSMContext):
             habit_id=habit_id, perfect_day=bool(perfect),
         )
         await _finish_turn(callback.message, user["id"], newly)
+        await callback.message.answer(
+            "Как настроение? (по желанию)", reply_markup=kb.mood_keyboard(habit_id)
+        )
+
+
+@router.callback_query(F.data.startswith("mood:"))
+async def set_mood_handler(callback: CallbackQuery, state: FSMContext):
+    _, hid, idx = callback.data.split(":")
+    habit, user = _owned_habit(int(hid), callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    mood = config.MOODS[int(idx)]
+    today = db.user_now(user["timezone"]).date().isoformat()
+    db.set_mood(int(hid), today, mood)
+    await callback.message.edit_text(f"Настроение отмечено: {mood}")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mood_skip")
+async def mood_skip(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Хорошо, без отметки настроения.")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("stat:"))
@@ -908,6 +1037,104 @@ async def shop_freeze_buy(callback: CallbackQuery, state: FSMContext):
     )
     newly = ach.check_all(user["id"], event="purchase")
     await _finish_turn(callback.message, user["id"], newly)
+
+
+@router.callback_query(F.data == "shop:luck")
+async def shop_luck(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    if user["coins"] < config.SHOP_LUCK_CHEST_COST:
+        await callback.answer(
+            f"Недостаточно монет: нужно {config.SHOP_LUCK_CHEST_COST}, у тебя {user['coins']}.",
+            show_alert=True,
+        )
+        return
+    await callback.message.edit_text(
+        f"Открыть сундук удачи за {config.SHOP_LUCK_CHEST_COST} монет?\n\n"
+        f"Внутри случайно от {config.LUCK_CHEST_MIN} до {config.LUCK_CHEST_MAX} монет. "
+        "Можно выиграть больше, чем потратил, а можно и меньше — это азарт.",
+        reply_markup=kb.luck_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "luckbuy")
+async def shop_luck_buy(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    res = db.buy_luck_chest(user["id"])
+    if res["status"] == "no_coins":
+        await callback.answer(
+            f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.", show_alert=True
+        )
+        return
+    net = res["won"] - res["cost"]
+    sign = "+" if net >= 0 else ""
+    await callback.answer(f"Выпало {res['won']} {_coins_word(res['won'])}!")
+    await callback.message.edit_text(
+        f"Сундук удачи открыт: выпало {res['won']} {_coins_word(res['won'])} "
+        f"(потрачено {res['cost']}, итог {sign}{net})."
+    )
+    newly = ach.check_all(user["id"], event="purchase")
+    await _finish_turn(callback.message, user["id"], newly)
+
+
+@router.callback_query(F.data == "shop:reset")
+async def shop_reset(callback: CallbackQuery, state: FSMContext):
+    user = _active_user(callback.from_user.id)
+    if user is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    habits = db.get_habits(user["id"])
+    if not habits:
+        await callback.answer("У тебя пока нет привычек.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Полный сброс привычки за {config.SHOP_RESET_COST} монет.\n\n"
+        "Вся история привычки будет стёрта, серия обнулится, отсчёт начнётся заново. "
+        "Выбери привычку:",
+        reply_markup=kb.shop_habits_keyboard(habits, "reset"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("resetsel:"))
+async def shop_reset_select(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Точно сбросить историю привычки «{habit['title']}»?\n"
+        f"Это нельзя отменить. Спишется {config.SHOP_RESET_COST} монет.",
+        reply_markup=kb.reset_confirm_keyboard(habit_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("resetbuy:"))
+async def shop_reset_buy(callback: CallbackQuery, state: FSMContext):
+    habit_id = int(callback.data.split(":", 1)[1])
+    habit, user = _owned_habit(habit_id, callback.from_user.id)
+    if habit is None:
+        await callback.answer("Не найдено.", show_alert=True)
+        return
+    today = db.user_now(user["timezone"]).date().isoformat()
+    res = db.reset_habit(user["id"], habit_id, today)
+    if res["status"] == "no_coins":
+        await callback.answer(
+            f"Недостаточно монет: нужно {res['need']}, у тебя {res['have']}.", show_alert=True
+        )
+        return
+    await callback.answer(f"Сброшено. Списано {res['cost']} {_coins_word(res['cost'])}.")
+    await callback.message.edit_text(
+        f"История привычки «{habit['title']}» обнулена. Отсчёт начинается заново."
+    )
 
 
 # =========================================================

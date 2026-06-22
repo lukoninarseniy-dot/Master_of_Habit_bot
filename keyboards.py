@@ -100,13 +100,20 @@ def habits_list_keyboard(habits) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def habit_card_keyboard(habit_id: int) -> InlineKeyboardMarkup:
+def habit_card_keyboard(habit_id: int, is_paused: int = 0) -> InlineKeyboardMarkup:
     """Кнопки управления конкретной привычкой."""
+    pause_btn = (
+        InlineKeyboardButton(text="Возобновить", callback_data=f"resume:{habit_id}")
+        if is_paused
+        else InlineKeyboardButton(text="Пауза/отпуск", callback_data=f"pause:{habit_id}")
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Изменить название", callback_data=f"et:{habit_id}")],
             [InlineKeyboardButton(text="Изменить расписание", callback_data=f"es:{habit_id}")],
             [InlineKeyboardButton(text="Изменить время", callback_data=f"etime:{habit_id}")],
+            [InlineKeyboardButton(text="Изменить категорию", callback_data=f"ecat:{habit_id}")],
+            [pause_btn],
             [InlineKeyboardButton(text="Удалить", callback_data=f"del:{habit_id}")],
             [InlineKeyboardButton(text="К списку", callback_data="back_list")],
         ]
@@ -174,6 +181,14 @@ def shop_keyboard() -> InlineKeyboardMarkup:
                 text=f"Заморозка серии — {config.SHOP_FREEZE_COST}",
                 callback_data="shop:freeze",
             )],
+            [InlineKeyboardButton(
+                text=f"Сундук удачи — {config.SHOP_LUCK_CHEST_COST}",
+                callback_data="shop:luck",
+            )],
+            [InlineKeyboardButton(
+                text=f"Полный сброс привычки — {config.SHOP_RESET_COST}",
+                callback_data="shop:reset",
+            )],
         ]
     )
 
@@ -188,8 +203,8 @@ def freeze_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def shop_habits_keyboard(habits, action: str) -> InlineKeyboardMarkup:
-    """Список привычек для покупки. action: 'skip' или 'repl'."""
-    prefix = "skipsel" if action == "skip" else "replsel"
+    """Список привычек для покупки. action: 'skip', 'repl' или 'reset'."""
+    prefix = {"skip": "skipsel", "repl": "replsel", "reset": "resetsel"}[action]
     rows = [
         [InlineKeyboardButton(text=h["title"], callback_data=f"{prefix}:{h['id']}")]
         for h in habits
@@ -212,5 +227,51 @@ def replace_text_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Пропустить", callback_data="repl_notext")],
             [InlineKeyboardButton(text="Отмена", callback_data="fsm_cancel")],
+        ]
+    )
+
+
+def category_keyboard(prefix: str, habit_id=None) -> InlineKeyboardMarkup:
+    """Выбор категории. Для добавления: prefix='cat' -> 'cat:<i>'.
+    Для редактирования: prefix='ecatset', habit_id задан -> 'ecatset:<id>:<i>'."""
+    rows = []
+    row = []
+    for i, name in enumerate(config.CATEGORIES):
+        cb = f"{prefix}:{i}" if habit_id is None else f"{prefix}:{habit_id}:{i}"
+        row.append(InlineKeyboardButton(text=name, callback_data=cb))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if habit_id is None:
+        rows.append([InlineKeyboardButton(text="Отмена", callback_data="fsm_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mood_keyboard(habit_id: int) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(text=m, callback_data=f"mood:{habit_id}:{i}")
+        for i, m in enumerate(config.MOODS)
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[row, [InlineKeyboardButton(text="Пропустить", callback_data="mood_skip")]]
+    )
+
+
+def luck_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, открыть", callback_data="luckbuy")],
+            [InlineKeyboardButton(text="Назад", callback_data="shop_back")],
+        ]
+    )
+
+
+def reset_confirm_keyboard(habit_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, сбросить историю", callback_data=f"resetbuy:{habit_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data="shop_back")],
         ]
     )
